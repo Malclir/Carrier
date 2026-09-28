@@ -657,7 +657,9 @@ pub(crate) fn recreate_messenger_window(
             state.messenger_loaded.swap(false, Ordering::AcqRel)
         };
 
+        crate::webview_watchdog::realtime_window_replacing(&label);
         if let Err(error) = window.destroy() {
+            crate::webview_watchdog::realtime_window_replacement_failed(&label);
             log::warn!("failed to destroy blank Messenger webview {label}: {error}");
             let state = app.state::<AppState>();
             {
@@ -729,6 +731,7 @@ pub(crate) fn recreate_messenger_window(
             // Frame recovery is bounded to this window. Restarting the entire
             // app would reset its budget and discard drafts in other windows.
             log::error!("failed to construct replacement Messenger window {label}; automatic frame recovery stopped, reopen Carrier from the tray or relaunch manually");
+            crate::webview_watchdog::realtime_window_rebuild_failed(&label);
             app.state::<AppState>()
                 .recreating
                 .store(false, Ordering::SeqCst);
@@ -742,6 +745,7 @@ pub(crate) fn recreate_messenger_window(
             "failed to rebuild blank Messenger webview {label} after \
              {MAX_BUILD_ATTEMPTS} attempts; restarting Carrier"
         );
+        crate::webview_watchdog::realtime_window_rebuild_failed(&label);
         app.restart();
     });
     true
@@ -775,10 +779,17 @@ pub(crate) fn recreate_themed_windows(app: &tauri::AppHandle) {
             .webview_windows()
             .into_iter()
             .filter(|(label, _)| label != "settings")
-            .map(|(label, window)| {
+            .filter_map(|(label, window)| {
                 let geometry = window.outer_position().ok().zip(window.inner_size().ok());
-                let _ = window.destroy();
-                (label, geometry)
+                crate::webview_watchdog::realtime_window_replacing(&label);
+                if let Err(error) = window.destroy() {
+                    crate::webview_watchdog::realtime_window_replacement_failed(&label);
+                    log::warn!(
+                        "failed to destroy Messenger webview {label} for theme change: {error}"
+                    );
+                    return None;
+                }
+                Some((label, geometry))
             })
             .collect();
         if !targets.is_empty() {
@@ -797,6 +808,8 @@ pub(crate) fn recreate_themed_windows(app: &tauri::AppHandle) {
                         let _ = window.set_position(tauri::Position::Physical(pos));
                         let _ = window.set_size(tauri::Size::Physical(size));
                     }
+                } else {
+                    crate::webview_watchdog::realtime_window_rebuild_failed(&label);
                 }
             }
         }

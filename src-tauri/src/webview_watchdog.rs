@@ -5,7 +5,7 @@
 //! process and reloads a Messenger window when its content-free heartbeat stops.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -57,6 +57,8 @@ const REALTIME_ERROR_TIMEOUT: Duration = Duration::from_secs(15);
 /// ...and a single reload attempt: if a reload already came back to the same
 /// error page, rebuilding the webview is the next useful step.
 const REALTIME_ERROR_RELOAD_LIMIT: u32 = 1;
+/// A healthy worker may briefly answer before the fatal dialog remounts.
+const REALTIME_ERROR_CLEAR_TIMEOUT: Duration = Duration::from_secs(60);
 
 // Cooldowns and probe slots are shared even when another renderer is frozen.
 // Account keys stay local and are never logged.
@@ -152,16 +154,212 @@ fn rate_limit_account(value: Option<&str>) -> &str {
 }
 
 static NEXT_WATCHDOG_ID: AtomicU64 = AtomicU64::new(1);
-// Survives window recreation (which builds a fresh watchdog); reset to zero
-// whenever any heartbeat proves the realtime transport healthy.
-static REALTIME_RECREATES: AtomicU32 = AtomicU32::new(0);
-
-/// Refund a claimed realtime rebuild that never actually happened. Saturating:
-/// an Ok heartbeat may have reset the counter to zero in the meantime.
-fn refund_realtime_recreate() {
-    let _ = REALTIME_RECREATES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-        Some(n.saturating_sub(1))
+// Survives window recreation (which builds a fresh watchdog). A new document
+// must stay healthy before it can replenish the rebuild budget.
+static REALTIME_RECREATE_BUDGET: Mutex<RealtimeRecreateBudget> =
+    Mutex::new(RealtimeRecreateBudget {
+        attempts: 0,
+        rebuilding: None,
+        replacement_id: None,
+        replacement_being_recreated: None,
+        replacement_exhausted: false,
+        healthy_since: None,
+        last_healthy_at: None,
     });
+
+#[derive(Default)]
+struct RealtimeRecreateBudget {
+    attempts: u32,
+    rebuilding: Option<(String, u64)>,
+    replacement_id: Option<u64>,
+    // Destroying this generation is part of an automatic replacement, not a close.
+    replacement_being_recreated: Option<u64>,
+    replacement_exhausted: bool,
+    healthy_since: Option<(u64, Instant)>,
+    last_healthy_at: Option<Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RealtimeRecreateClaim {
+    Granted,
+    WaitingForOtherWindow,
+    WaitingForRecovery,
+    Exhausted,
+}
+
+impl RealtimeRecreateBudget {
+    fn claim(&mut self, label: &str, id: u64) -> RealtimeRecreateClaim {
+        if self.attempts >= REALTIME_RECREATE_LIMIT {
+            if self
+                .rebuilding
+                .as_ref()
+                .is_some_and(|(rebuilt_label, _)| rebuilt_label == label)
+                && self.replacement_id == Some(id)
+            {
+                self.replacement_exhausted = true;
+            }
+            return if self
+                .rebuilding
+                .as_ref()
+                .is_some_and(|(rebuilt_label, _)| rebuilt_label != label)
+            {
+                if self.replacement_exhausted {
+                    RealtimeRecreateClaim::WaitingForRecovery
+                } else {
+                    RealtimeRecreateClaim::WaitingForOtherWindow
+                }
+            } else {
+                RealtimeRecreateClaim::Exhausted
+            };
+        }
+        self.attempts += 1;
+        self.rebuilding = Some((label.to_owned(), id));
+        self.replacement_id = None;
+        self.replacement_being_recreated = None;
+        self.replacement_exhausted = false;
+        self.healthy_since = None;
+        self.last_healthy_at = None;
+        RealtimeRecreateClaim::Granted
+    }
+
+    fn refund(&mut self) {
+        self.attempts = self.attempts.saturating_sub(1);
+        self.rebuilding = None;
+        self.replacement_id = None;
+        self.replacement_being_recreated = None;
+        self.replacement_exhausted = false;
+        self.healthy_since = None;
+        self.last_healthy_at = None;
+    }
+
+    fn window_installed(&mut self, label: &str, id: u64) {
+        if self
+            .rebuilding
+            .as_ref()
+            .is_some_and(|(rebuilt_label, old_id)| rebuilt_label == label && id != *old_id)
+        {
+            self.replacement_id = Some(id);
+        }
+    }
+
+    fn window_replacing(&mut self, label: &str) {
+        if self
+            .rebuilding
+            .as_ref()
+            .is_some_and(|(rebuilt_label, _)| rebuilt_label == label)
+        {
+            self.replacement_being_recreated = self.replacement_id;
+        }
+    }
+
+    fn replacement_failed(&mut self, label: &str) {
+        if self
+            .rebuilding
+            .as_ref()
+            .is_some_and(|(rebuilt_label, _)| rebuilt_label == label)
+        {
+            self.replacement_being_recreated = None;
+        }
+    }
+
+    fn rebuild_failed(&mut self, label: &str) {
+        if self
+            .rebuilding
+            .as_ref()
+            .is_some_and(|(rebuilt_label, _)| rebuilt_label == label)
+        {
+            self.refund();
+        }
+    }
+
+    fn window_destroyed(&mut self, label: &str, id: u64) {
+        if self.replacement_being_recreated == Some(id) {
+            self.replacement_being_recreated = None;
+            if self.replacement_id == Some(id) {
+                self.replacement_id = None;
+            }
+            return;
+        }
+        if self.rebuilding.as_ref().is_some_and(|(rebuilt_label, _)| {
+            rebuilt_label == label && self.replacement_id == Some(id)
+        }) {
+            self.refund();
+        }
+    }
+
+    #[cfg(any(test, target_os = "macos"))]
+    fn pause_confirmation(&mut self) {
+        self.healthy_since = None;
+        self.last_healthy_at = None;
+    }
+
+    /// Only the replacement of the rebuilt window can confirm that rebuild.
+    /// Other windows may keep reporting healthy throughout the failed episode.
+    fn observe(&mut self, label: &str, id: u64, now: Instant, healthy: bool) -> bool {
+        if self.attempts == 0 {
+            return true;
+        }
+        if !self
+            .rebuilding
+            .as_ref()
+            .is_some_and(|(rebuilt_label, old_id)| rebuilt_label == label && id != *old_id)
+        {
+            return false;
+        }
+        if !healthy {
+            self.healthy_since = None;
+            self.last_healthy_at = None;
+            return false;
+        }
+        if self
+            .healthy_since
+            .is_none_or(|(healthy_id, _)| healthy_id != id)
+            || self.last_healthy_at.is_none_or(|last| {
+                now.saturating_duration_since(last) >= REALTIME_HEARTBEAT_GAP_RESET
+            })
+        {
+            self.healthy_since = Some((id, now));
+        }
+        self.last_healthy_at = Some(now);
+        let since = self.healthy_since.map_or(now, |(_, since)| since);
+        if now.duration_since(since) >= REALTIME_ERROR_CLEAR_TIMEOUT {
+            self.attempts = 0;
+            self.rebuilding = None;
+            self.replacement_id = None;
+            self.replacement_being_recreated = None;
+            self.replacement_exhausted = false;
+            self.healthy_since = None;
+            self.last_healthy_at = None;
+            return true;
+        }
+        false
+    }
+}
+
+/// Refund a claimed realtime rebuild that never actually happened.
+fn refund_realtime_recreate() {
+    REALTIME_RECREATE_BUDGET.lock().unwrap().refund();
+}
+
+pub(crate) fn realtime_window_replacing(label: &str) {
+    REALTIME_RECREATE_BUDGET
+        .lock()
+        .unwrap()
+        .window_replacing(label);
+}
+
+pub(crate) fn realtime_window_replacement_failed(label: &str) {
+    REALTIME_RECREATE_BUDGET
+        .lock()
+        .unwrap()
+        .replacement_failed(label);
+}
+
+pub(crate) fn realtime_window_rebuild_failed(label: &str) {
+    REALTIME_RECREATE_BUDGET
+        .lock()
+        .unwrap()
+        .rebuild_failed(label);
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,6 +462,8 @@ struct WatchdogState {
     realtime_error_page: bool,
     realtime_reloads: u32,
     realtime_exhausted: bool,
+    error_reload_pending: bool,
+    error_clear_since: Option<Duration>,
     render: RenderRecovery,
 }
 
@@ -282,6 +482,7 @@ impl WatchdogState {
             .is_some_and(|last| now.saturating_sub(last) >= REALTIME_HEARTBEAT_GAP_RESET)
         {
             self.realtime_bad_since = None;
+            self.error_clear_since = None;
         }
         self.last_heartbeat_at = Some(now);
         self.unresponsive_reload_attempted = false;
@@ -301,19 +502,29 @@ impl WatchdogState {
         self.realtime_error_page = matches!(realtime, Some(RealtimeSignal::Error));
         match realtime {
             // A proven-healthy transport ends the episode: the reload budget
-            // and the give-up latch re-arm in full.
+            // and the give-up latch re-arm once a reloaded fatal dialog has
+            // stayed away long enough to establish recovery.
             Some(RealtimeSignal::Ok) => {
                 self.realtime_bad_since = None;
-                self.realtime_reloads = 0;
-                self.realtime_exhausted = false;
+                let recovered = !self.error_reload_pending
+                    || now.saturating_sub(*self.error_clear_since.get_or_insert(now))
+                        >= REALTIME_ERROR_CLEAR_TIMEOUT;
+                if recovered {
+                    self.realtime_reloads = 0;
+                    self.realtime_exhausted = false;
+                    self.error_reload_pending = false;
+                    self.error_clear_since = None;
+                }
             }
             Some(RealtimeSignal::Stale | RealtimeSignal::Never | RealtimeSignal::Error) => {
+                self.error_clear_since = None;
                 self.realtime_bad_since.get_or_insert(now);
             }
             // "pending" pauses the timer without refunding the reload budget —
             // a reload into a still-broken page must not reset escalation.
             Some(RealtimeSignal::Pending | RealtimeSignal::Managed | RealtimeSignal::Unknown)
             | None => {
+                self.error_clear_since = None;
                 self.realtime_bad_since = None;
             }
         }
@@ -372,7 +583,7 @@ impl WatchdogState {
                 self.unresponsive_action()
             };
         }
-        // Facebook's static error page is a certainty, not a suspicion: confirm
+        // Facebook's fatal error UI is a certainty, not a suspicion: confirm
         // briefly, spend one reload, then go straight to a rebuild.
         let (bad_timeout, reload_limit) = if self.realtime_error_page {
             (REALTIME_ERROR_TIMEOUT, REALTIME_ERROR_RELOAD_LIMIT)
@@ -434,6 +645,7 @@ impl WatchdogState {
         self.missing_content_since = None;
         self.realtime_bad_since = None;
         self.realtime_error_page = false;
+        self.error_clear_since = None;
     }
 
     fn blank_reload_started(&mut self, now: Duration) {
@@ -443,6 +655,8 @@ impl WatchdogState {
     }
 
     fn realtime_reload_started(&mut self, now: Duration) {
+        self.error_reload_pending |= self.realtime_error_page;
+        self.error_clear_since = None;
         self.realtime_reloads += 1;
         self.realtime_bad_since = None;
         self.navigation_started(now);
@@ -465,6 +679,8 @@ impl WatchdogState {
         self.realtime_error_page = false;
         self.realtime_reloads = 0;
         self.realtime_exhausted = false;
+        self.error_reload_pending = false;
+        self.error_clear_since = None;
     }
 }
 
@@ -516,6 +732,10 @@ impl WebviewWatchdog {
     /// macOS theme change rebuilds a window under the same label.
     pub(crate) fn install(&self, window: &WebviewWindow) {
         let watchdog_id = self.id;
+        REALTIME_RECREATE_BUDGET
+            .lock()
+            .unwrap()
+            .window_installed(window.label(), watchdog_id);
         let started_at = self.started_at;
         let heartbeat_state = Arc::clone(&self.state);
         let listener_window = window.clone();
@@ -571,9 +791,16 @@ impl WebviewWatchdog {
                 payload.content_present,
                 payload.realtime,
             );
+            let reload_recovered = !state.error_reload_pending;
             drop(state);
-            if payload.realtime == Some(RealtimeSignal::Ok) && !cooling_down {
-                REALTIME_RECREATES.store(0, Ordering::Relaxed);
+            let healthy = payload.realtime == Some(RealtimeSignal::Ok) && !cooling_down;
+            let rebuild_recovered = REALTIME_RECREATE_BUDGET.lock().unwrap().observe(
+                listener_window.label(),
+                watchdog_id,
+                Instant::now(),
+                healthy,
+            );
+            if healthy && reload_recovered && rebuild_recovered {
                 // A healthy sibling cannot announce recovery while this
                 // account is cooling down. The gate pairs watchdog notices.
                 crate::notifications::show_sync_alert(
@@ -616,9 +843,14 @@ impl WebviewWatchdog {
         let alive = Arc::new(AtomicBool::new(true));
         let window_alive = Arc::clone(&alive);
         let focus_state = Arc::clone(&self.state);
+        let destroyed_label = window.label().to_owned();
         window.on_window_event(move |event| {
             if matches!(event, WindowEvent::Destroyed) {
                 window_alive.store(false, Ordering::Release);
+                REALTIME_RECREATE_BUDGET
+                    .lock()
+                    .unwrap()
+                    .window_destroyed(&destroyed_label, watchdog_id);
             }
             if matches!(event, WindowEvent::Focused(_)) {
                 focus_state
@@ -661,6 +893,10 @@ impl WebviewWatchdog {
                     if current_generation != resume_generation {
                         resume_generation = current_generation;
                         state.lock().unwrap().system_resumed(started_at.elapsed());
+                        REALTIME_RECREATE_BUDGET
+                            .lock()
+                            .unwrap()
+                            .pause_confirmation();
                     }
                 }
 
@@ -934,16 +1170,23 @@ impl WebviewWatchdog {
                                     // One atomic claim of the rebuild budget:
                                     // concurrent window watchdogs must not both
                                     // pass a separate check-then-increment.
-                                    let claimed = REALTIME_RECREATES
-                                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                                            (n < REALTIME_RECREATE_LIMIT).then_some(n + 1)
-                                        })
-                                        .is_ok();
-                                    if !claimed {
+                                    let claim = REALTIME_RECREATE_BUDGET
+                                        .lock()
+                                        .unwrap()
+                                        .claim(&label, watchdog_id);
+                                    if claim != RealtimeRecreateClaim::Granted {
                                         recovery_coordinator()
                                             .lock()
                                             .unwrap()
                                             .refund(&account, permit);
+                                        if matches!(
+                                            claim,
+                                            RealtimeRecreateClaim::WaitingForOtherWindow
+                                                | RealtimeRecreateClaim::WaitingForRecovery
+                                        ) {
+                                            next_recovery_attempt = now + REACHABILITY_RETRY;
+                                            continue;
+                                        }
                                         state.lock().unwrap().realtime_recovery_exhausted();
                                         log::warn!(
                                             "Messenger webview {label} realtime transport still dead after rebuilding; giving up automated recovery until it reports healthy"
@@ -1726,6 +1969,214 @@ mod tests {
             state.action(Duration::from_secs(40)),
             WatchdogAction::RecreateRealtime
         );
+    }
+
+    #[test]
+    fn transient_health_before_fatal_dialog_remount_preserves_escalation() {
+        let mut state = WatchdogState::default();
+        feed_realtime(&mut state, 0, 15, RealtimeSignal::Error);
+        state.realtime_reload_started(Duration::from_secs(15));
+
+        feed_realtime(&mut state, 20, 30, RealtimeSignal::Ok);
+        assert_eq!(state.realtime_reloads, 1);
+        assert!(state.error_reload_pending);
+        feed_realtime(&mut state, 35, 50, RealtimeSignal::Error);
+        assert_eq!(
+            state.action(Duration::from_secs(50)),
+            WatchdogAction::RecreateRealtime
+        );
+
+        feed_realtime(&mut state, 55, 110, RealtimeSignal::Ok);
+        assert_eq!(state.realtime_reloads, 1);
+        feed_realtime(&mut state, 115, 115, RealtimeSignal::Ok);
+        assert_eq!(state.realtime_reloads, 0);
+        assert!(!state.error_reload_pending);
+        feed_realtime(&mut state, 120, 135, RealtimeSignal::Error);
+        assert_eq!(
+            state.action(Duration::from_secs(135)),
+            WatchdogAction::ReloadRealtime
+        );
+    }
+
+    #[test]
+    fn transient_health_after_rebuild_does_not_refund_global_budget() {
+        let mut budget = RealtimeRecreateBudget::default();
+        let start = Instant::now();
+        assert_eq!(budget.claim("main", 1), RealtimeRecreateClaim::Granted);
+
+        assert!(!budget.observe("main", 2, start + Duration::from_secs(5), true));
+        assert!(!budget.observe("main", 2, start + Duration::from_secs(15), true));
+        assert!(!budget.observe("main", 2, start + Duration::from_secs(20), false));
+        assert_eq!(
+            budget.claim("other", 3),
+            RealtimeRecreateClaim::WaitingForOtherWindow
+        );
+
+        for second in (25..=80).step_by(5) {
+            assert!(!budget.observe("main", 2, start + Duration::from_secs(second), true));
+            assert!(!budget.observe("other", 3, start + Duration::from_secs(second), true));
+        }
+        assert!(budget.observe("main", 2, start + Duration::from_secs(85), true));
+        assert_eq!(budget.claim("other", 3), RealtimeRecreateClaim::Granted);
+    }
+
+    #[test]
+    fn rebuild_confirmation_requires_active_heartbeats_from_replacement() {
+        let mut budget = RealtimeRecreateBudget::default();
+        let start = Instant::now();
+        assert_eq!(budget.claim("main", 1), RealtimeRecreateClaim::Granted);
+
+        assert!(!budget.observe("main", 1, start, true));
+        assert!(!budget.observe("other", 3, start + Duration::from_secs(60), true));
+        assert!(!budget.observe("main", 2, start + Duration::from_secs(65), true));
+        // Sleep cannot turn the first response into a confirmed recovery.
+        assert!(!budget.observe("main", 2, start + Duration::from_secs(130), true));
+        for second in (135..190).step_by(5) {
+            assert!(!budget.observe("main", 2, start + Duration::from_secs(second), true));
+        }
+        assert!(budget.observe("main", 2, start + Duration::from_secs(190), true));
+    }
+
+    #[test]
+    fn closing_replacement_refunds_only_its_rebuild_claim() {
+        let mut budget = RealtimeRecreateBudget::default();
+        assert_eq!(budget.claim("win-1", 1), RealtimeRecreateClaim::Granted);
+        budget.window_installed("win-1", 2);
+        budget.window_destroyed("win-1", 1);
+        budget.window_destroyed("win-2", 2);
+        assert_eq!(budget.attempts, 1);
+
+        budget.window_destroyed("win-1", 2);
+        assert_eq!(budget.claim("win-2", 3), RealtimeRecreateClaim::Granted);
+    }
+
+    #[test]
+    fn automatic_replacement_keeps_rebuild_claim_until_successor_is_healthy() {
+        let mut budget = RealtimeRecreateBudget::default();
+        let start = Instant::now();
+        assert_eq!(budget.claim("main", 1), RealtimeRecreateClaim::Granted);
+        budget.window_installed("main", 2);
+        budget.window_replacing("main");
+        budget.window_destroyed("main", 2);
+        budget.window_installed("main", 3);
+        assert_eq!(budget.claim("main", 3), RealtimeRecreateClaim::Exhausted);
+        budget.window_replacing("main");
+        budget.window_destroyed("main", 3);
+        budget.window_installed("main", 4);
+        assert_eq!(budget.claim("main", 4), RealtimeRecreateClaim::Exhausted);
+
+        for second in (0..60).step_by(5) {
+            assert!(!budget.observe("main", 4, start + Duration::from_secs(second), true));
+        }
+        assert!(budget.observe("main", 4, start + Duration::from_secs(60), true));
+        assert_eq!(budget.claim("main", 4), RealtimeRecreateClaim::Granted);
+    }
+
+    #[test]
+    fn failed_automatic_replacement_still_refunds_on_close() {
+        let mut budget = RealtimeRecreateBudget::default();
+        assert_eq!(budget.claim("main", 1), RealtimeRecreateClaim::Granted);
+        budget.window_installed("main", 2);
+        budget.window_replacing("main");
+        budget.replacement_failed("main");
+        assert_eq!(budget.claim("main", 2), RealtimeRecreateClaim::Exhausted);
+        budget.window_destroyed("main", 2);
+        assert_eq!(budget.claim("main", 3), RealtimeRecreateClaim::Granted);
+    }
+
+    #[test]
+    fn failed_rebuild_refunds_only_its_window_claim() {
+        let mut budget = RealtimeRecreateBudget::default();
+        assert_eq!(budget.claim("main", 1), RealtimeRecreateClaim::Granted);
+        budget.window_installed("main", 2);
+        budget.window_replacing("main");
+        budget.window_destroyed("main", 2);
+        budget.rebuild_failed("other");
+        assert_eq!(
+            budget.claim("other", 3),
+            RealtimeRecreateClaim::WaitingForOtherWindow
+        );
+        budget.rebuild_failed("main");
+        assert_eq!(budget.claim("other", 3), RealtimeRecreateClaim::Granted);
+    }
+
+    #[test]
+    fn late_old_destroy_does_not_discard_new_replacement() {
+        let mut budget = RealtimeRecreateBudget::default();
+        assert_eq!(budget.claim("main", 1), RealtimeRecreateClaim::Granted);
+        budget.window_installed("main", 2);
+        budget.window_replacing("main");
+        budget.window_installed("main", 3);
+        budget.window_destroyed("main", 2);
+        budget.window_destroyed("main", 3);
+        assert_eq!(budget.claim("main", 4), RealtimeRecreateClaim::Granted);
+    }
+
+    #[test]
+    fn another_window_waits_for_rebuild_confirmation_without_being_exhausted() {
+        let mut budget = RealtimeRecreateBudget::default();
+        let mut other = WatchdogState {
+            realtime_reloads: REALTIME_RELOAD_LIMIT,
+            ..WatchdogState::default()
+        };
+        feed_realtime(&mut other, 0, 120, RealtimeSignal::Never);
+        assert_eq!(budget.claim("main", 1), RealtimeRecreateClaim::Granted);
+        assert_eq!(
+            budget.claim("win-1", 3),
+            RealtimeRecreateClaim::WaitingForOtherWindow
+        );
+        assert_eq!(
+            other.action(Duration::from_secs(120)),
+            WatchdogAction::RecreateRealtime
+        );
+
+        let start = Instant::now();
+        for second in (0..=60).step_by(5) {
+            budget.observe("main", 2, start + Duration::from_secs(second), true);
+        }
+        assert_eq!(budget.claim("win-1", 3), RealtimeRecreateClaim::Granted);
+    }
+
+    #[test]
+    fn replacement_exhaustion_releases_waiting_windows_without_losing_health_confirmation() {
+        let mut budget = RealtimeRecreateBudget::default();
+        let start = Instant::now();
+        assert_eq!(budget.claim("main", 1), RealtimeRecreateClaim::Granted);
+        budget.window_installed("main", 2);
+        assert_eq!(
+            budget.claim("other", 3),
+            RealtimeRecreateClaim::WaitingForOtherWindow
+        );
+        assert_eq!(budget.claim("main", 2), RealtimeRecreateClaim::Exhausted);
+        assert_eq!(
+            budget.claim("other", 3),
+            RealtimeRecreateClaim::WaitingForRecovery
+        );
+
+        for second in (0..60).step_by(5) {
+            assert!(!budget.observe("main", 2, start + Duration::from_secs(second), true));
+        }
+        assert!(budget.observe("main", 2, start + Duration::from_secs(60), true));
+        assert_eq!(budget.claim("other", 3), RealtimeRecreateClaim::Granted);
+    }
+
+    #[test]
+    fn resume_restarts_reload_and_rebuild_health_confirmation() {
+        let mut state = WatchdogState::default();
+        feed_realtime(&mut state, 0, 15, RealtimeSignal::Error);
+        state.realtime_reload_started(Duration::from_secs(15));
+        feed_realtime(&mut state, 20, 25, RealtimeSignal::Ok);
+        state.system_resumed(Duration::from_secs(80));
+        feed_realtime(&mut state, 85, 85, RealtimeSignal::Ok);
+        assert_eq!(state.realtime_reloads, 1);
+        assert!(state.error_reload_pending);
+
+        let mut budget = RealtimeRecreateBudget::default();
+        let start = Instant::now();
+        assert_eq!(budget.claim("main", 1), RealtimeRecreateClaim::Granted);
+        assert!(!budget.observe("main", 2, start, true));
+        budget.pause_confirmation();
+        assert!(!budget.observe("main", 2, start + Duration::from_secs(65), true));
     }
 
     #[test]

@@ -119,6 +119,7 @@ async function runFixtures(
   Object.defineProperty(navigator, "onLine", { configurable: true, get: () => online });
   const connectionListeners = new Set<(value: unknown) => void>();
   const reports: string[] = [];
+  let protectedReport = false;
   const setup = {
     getOrSetupWorker(..._args: unknown[]) {
       recoveries++;
@@ -166,9 +167,12 @@ async function runFixtures(
     __TAURI_INTERNALS__: {
       invoke: async (
         _command: string,
-        args: { event?: string; payload?: { realtime?: string } },
+        args: { event?: string; payload?: { realtime?: string; protected?: boolean } },
       ) => {
-        if (args?.payload?.realtime) reports.push(args.payload.realtime);
+        if (args?.payload?.realtime) {
+          reports.push(args.payload.realtime);
+          protectedReport = args.payload.protected === true;
+        }
       },
     },
   });
@@ -232,6 +236,127 @@ async function runFixtures(
       "healthy lifecycle events do not mutate the worker",
       recoveries === 1 && performance.timeOrigin === origin,
     );
+    const errorHost = document.createElement("div");
+    errorHost.innerHTML = `<div><h2>Sorry, something went wrong</h2><p>Please try closing and re-opening your browser window.</p><button>OK</button></div>`;
+    document.body.appendChild(errorHost);
+    const errorDialog = errorHost.firstElementChild as HTMLElement;
+    await tick();
+    assert("error copy in chat content does not trigger recovery", reports.at(-1) === "ok");
+    errorDialog.setAttribute("role", "dialog");
+    await tick();
+    assert("matching English text alone cannot trigger recovery", reports.at(-1) === "ok");
+    function exceptionComponent() {}
+    const exception = { type: exceptionComponent, memoizedProps: { errorCode: 1357004 } };
+    modules["FDSCometExceptionDialogImpl.react"] = exceptionComponent;
+    modules.ReactDOM = {
+      __DOM_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE: {
+        Events: [
+          (element: Element) =>
+            element === errorDialog ? { stateNode: element, return: exception } : null,
+        ],
+      },
+    };
+    await tick();
+    assert("fatal dialog overrides healthy transport", reports.at(-1) === "error");
+    errorDialog.querySelector("h2")!.textContent = "Beklager, noe gikk galt";
+    errorDialog.querySelector("p")!.textContent =
+      "Prøv å lukke nettleservinduet og åpne det igjen.";
+    await tick();
+    assert("translated dialog uses the same error code", reports.at(-1) === "error");
+    composer.textContent = "Keep my draft";
+    await tick();
+    assert("fatal dialog retains draft protection", reports.at(-1) === "error" && protectedReport);
+    composer.textContent = "";
+    window.__carrierInCall = true;
+    await tick();
+    assert("fatal dialog retains call protection", reports.at(-1) === "error" && protectedReport);
+    window.__carrierInCall = false;
+    online = false;
+    window.dispatchEvent(new Event("offline"));
+    await tick();
+    assert("offline error waits for network restoration", reports.at(-1) === "pending");
+    online = true;
+    window.dispatchEvent(new Event("online"));
+    await tick();
+    assert("restored network reports fatal error", reports.at(-1) === "error");
+    for (const style of [
+      "display:none",
+      "visibility:hidden",
+      "opacity:0",
+      "content-visibility:hidden",
+      "position:fixed;top:100vh",
+      "position:fixed;left:100vw",
+      "position:fixed;bottom:100vh",
+      "position:fixed;right:100vw",
+    ]) {
+      errorHost.setAttribute("style", style);
+      await tick();
+      assert(`hidden fatal dialog ignored (${style})`, reports.at(-1) === "ok");
+    }
+    errorHost.removeAttribute("style");
+    errorHost.style.cssText =
+      "position:fixed;top:10px;left:10px;width:10px;height:10px;overflow:hidden";
+    errorDialog.style.cssText = "position:fixed;top:40px;left:40px;width:200px;height:80px";
+    await tick();
+    assert("viewport-fixed fatal dialog escapes ancestor clip", reports.at(-1) === "error");
+    errorHost.style.transform = "translateZ(0)";
+    // WKWebView can report null even with a transformed fixed containing block.
+    Object.defineProperty(errorDialog, "offsetParent", { configurable: true, get: () => null });
+    await tick();
+    assert("fixed dialog within clipped containing block is ignored", reports.at(-1) === "ok");
+    Reflect.deleteProperty(errorDialog, "offsetParent");
+    errorHost.style.removeProperty("transform");
+    errorHost.style.cssText = "position:relative;left:10px;top:10px;width:10px;height:10px";
+    const overflowWrapper = document.createElement("div");
+    overflowWrapper.style.cssText = "width:10px;height:10px;overflow:hidden";
+    errorHost.appendChild(overflowWrapper);
+    overflowWrapper.appendChild(errorDialog);
+    errorDialog.style.cssText = "position:absolute;left:30px;top:30px;width:200px;height:80px";
+    assert("dialog is positioned against outer host", errorDialog.offsetParent === errorHost);
+    await tick();
+    assert("absolute dialog escapes intervening overflow", reports.at(-1) === "error");
+    errorHost.style.overflow = "hidden";
+    await tick();
+    assert("containing block clips absolute dialog", reports.at(-1) === "ok");
+    errorHost.appendChild(errorDialog);
+    overflowWrapper.remove();
+    errorHost.style.cssText =
+      "position:fixed;top:10px;left:10px;width:10px;height:10px;overflow:hidden";
+    for (const offset of ["left:20px", "top:20px"]) {
+      errorDialog.style.cssText = `position:relative;${offset}`;
+      await tick();
+      assert(`overflow-clipped fatal dialog ignored (${offset})`, reports.at(-1) === "ok");
+    }
+    errorDialog.removeAttribute("style");
+    errorHost.removeAttribute("style");
+    errorHost.setAttribute("aria-hidden", "true");
+    await tick();
+    assert("inaccessible old dialog ignored", reports.at(-1) === "ok");
+    errorHost.removeAttribute("aria-hidden");
+    exception.memoizedProps.errorCode = 999;
+    await tick();
+    assert("unrelated exception code is not fatal", reports.at(-1) === "ok");
+    exception.memoizedProps.errorCode = 1357004;
+    modules["FDSCometExceptionDialogImpl.react"] = () => {};
+    await tick();
+    assert("unrelated component with the same code is ignored", reports.at(-1) === "ok");
+    modules["FDSCometExceptionDialogImpl.react"] = exceptionComponent;
+    const reactDOM = modules.ReactDOM;
+    modules.ReactDOM = {};
+    await tick();
+    assert("changed React API retains manual recovery", reports.at(-1) === "ok");
+    modules.ReactDOM = reactDOM;
+    errorDialog.setAttribute("role", "alertdialog");
+    await tick();
+    assert("fatal alertdialog is recognized too", reports.at(-1) === "error");
+    history.replaceState(null, "", "/login");
+    await tick();
+    assert("login flow is not automatically recovered", reports.at(-1) === "pending");
+    history.replaceState(null, "", "/messages");
+    errorHost.remove();
+    await tick();
+    assert("dismissed error returns to verified health", reports.at(-1) === "ok");
+    assert("fatal dialog never invokes worker repair", recoveries === 1);
     connected = successful = false;
     supported = false;
     for (let i = 0; i < 10; i++) await tick();

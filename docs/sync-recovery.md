@@ -4,6 +4,22 @@ Responsive Messenger pages repair the messaging worker without navigation.
 Focus, visibility, wake, notifications, and going online trigger health checks;
 they are no longer reasons to periodically reload the page.
 
+The fatal “Sorry, something went wrong” dialog asking to close and re-open the
+browser instead uses native error recovery, even if the worker still reports
+healthy. Carrier recognizes error code `1357004` on the mounted
+`FDSCometExceptionDialogImpl.react` component behind a visible dialog, independent
+of its language. The code and component identity were confirmed on the affected
+Mac. No message text, translated labels, or error descriptions are read. After
+15 seconds of error heartbeats it reloads; if the error persists, it can rebuild
+the webview once.
+Existing draft, call, sleep, network, rate-limit, and Hold Failures guards apply.
+Hidden or offscreen dialogs and unrelated error codes do not trigger this path.
+The inspected React build stores host fibers in a WeakMap exposed through its
+internal Events accessor. Missing or changed module/accessor shapes leave manual
+recovery available; traversal is bounded and never invokes a React component.
+Healthy transport resets the retry budget after the dialog has stayed away for
+60 seconds following a fatal-error reload.
+
 ## Detection and recovery
 
 The encrypted connection state and worker heartbeat are authoritative. A healthy
@@ -342,7 +358,20 @@ recovery; multi-window calls are protected by the one-window requirement.
 
 ## Validation and remaining limits
 
-Live tests used a diagnostics build and a separate persistent signed-in profile:
+Live tests used diagnostics builds, including the affected installed session:
+
+- On September 28, inspect the actual stuck dialog in the installed Mac
+  diagnostics build (`b039220`). Its mounted exception has numeric error code
+  `1357004`. Execute the compiled detector against that dialog, temporarily
+  replace its rendered text with Norwegian and Japanese, and restore it in the
+  same synchronous probe. Detection succeeds for all three. With no draft or
+  call, temporarily feed the detector's result into that document's existing
+  native heartbeats. The watchdog records `ReloadRealtime` and reloads after
+  about 17 seconds. The dialog disappears, the temporary hook disappears with
+  the document, and a fresh worker heartbeat plus requested connection-state
+  delivery confirm connectivity. This tests the compiled detector and existing
+  native recovery in the affected session; it does not install a candidate app
+  or exercise a different Facebook locale/account. No message is sent.
 
 - Close only this page's worker MessagePort, confirm failed heartbeats, and let
   automatic recovery run. Verify a successful heartbeat, encrypted connectivity,

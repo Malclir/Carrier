@@ -192,6 +192,88 @@
     return next === "rate-limit-manual" || pending !== "manual" || next === "manual";
   };
 
+  // inject/src/messenger/lib/facebook-error-dialog.ts
+  var RELOAD_ERROR_CODE = 1357004;
+  function isReloadException(dialog) {
+    try {
+      const facebookRequire = window.require;
+      const component = facebookRequire?.("FDSCometExceptionDialogImpl.react");
+      if (typeof component !== "function") return false;
+      const reactDOM = facebookRequire?.("ReactDOM");
+      const events = reactDOM?.__DOM_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE?.Events;
+      if (!Array.isArray(events) || typeof events[0] !== "function") return false;
+      let fiber = events[0](dialog);
+      if (!fiber || typeof fiber !== "object" || !("stateNode" in fiber) || fiber.stateNode !== dialog) {
+        return false;
+      }
+      for (let depth = 0; fiber && typeof fiber === "object" && depth < 80; depth++) {
+        const node = fiber;
+        if (node.type === component) {
+          const props = node.memoizedProps;
+          return !!props && typeof props === "object" && "errorCode" in props && props.errorCode === RELOAD_ERROR_CODE;
+        }
+        fiber = node.return;
+      }
+    } catch (_) {
+    }
+    return false;
+  }
+  function hasFacebookReloadDialog() {
+    for (const dialog of document.querySelectorAll(
+      '[role="dialog"], [role="alertdialog"]'
+    )) {
+      const rect = dialog.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0 || rect.bottom <= 0 || rect.right <= 0 || rect.top >= innerHeight || rect.left >= innerWidth) {
+        continue;
+      }
+      let hidden = false;
+      let left = Math.max(rect.left, 0);
+      let right = Math.min(rect.right, innerWidth);
+      let top = Math.max(rect.top, 0);
+      let bottom = Math.min(rect.bottom, innerHeight);
+      const position = getComputedStyle(dialog).position;
+      let containingBlock;
+      if (position === "absolute") {
+        containingBlock = dialog.offsetParent;
+      } else if (position === "fixed") {
+        containingBlock = null;
+        for (let ancestor = dialog.parentElement; ancestor; ancestor = ancestor.parentElement) {
+          const style = getComputedStyle(ancestor);
+          if (style.transform !== "none" || style.perspective !== "none" || style.filter !== "none" || !!style.backdropFilter && style.backdropFilter !== "none" || /\b(transform|perspective|filter|backdrop-filter)\b/.test(style.willChange) || /\b(layout|paint|strict|content)\b/.test(style.contain)) {
+            containingBlock = ancestor;
+            break;
+          }
+        }
+      }
+      let clipsPositionedDialog = containingBlock === void 0;
+      for (let el = dialog; el; el = el.parentElement) {
+        const style = getComputedStyle(el);
+        if (el.getAttribute("aria-hidden") === "true" || style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse" || style.contentVisibility === "hidden" || Number(style.opacity) === 0) {
+          hidden = true;
+          break;
+        }
+        if (el === containingBlock) clipsPositionedDialog = true;
+        if (el !== dialog && clipsPositionedDialog) {
+          const bounds = el.getBoundingClientRect();
+          if (style.overflowX !== "visible") {
+            left = Math.max(left, bounds.left);
+            right = Math.min(right, bounds.right);
+          }
+          if (style.overflowY !== "visible") {
+            top = Math.max(top, bounds.top);
+            bottom = Math.min(bottom, bounds.bottom);
+          }
+          if (left >= right || top >= bottom) {
+            hidden = true;
+            break;
+          }
+        }
+      }
+      if (!hidden && isReloadException(dialog)) return true;
+    }
+    return false;
+  }
+
   // inject/src/messenger/lib/realtime-health.ts
   var REALTIME_CONNECT_GRACE_MS = 15e3;
   var REALTIME_SILENCE_MS = 9e4;
@@ -1754,7 +1836,7 @@
     const realtimeRecovery = new RealtimeRecoveryTracker(Date.now());
     const onFacebookErrorPage = () => {
       try {
-        return looksLikeFacebookErrorPage({
+        return hasFacebookReloadDialog() || looksLikeFacebookErrorPage({
           hasBackLink: !!document.getElementById("back"),
           hasIconImage: document.getElementById("icon") instanceof HTMLImageElement,
           elementCount: document.getElementsByTagName("*").length
@@ -1764,7 +1846,7 @@
       }
     };
     const realtimeStatus = () => {
-      if (systemSleeping || rateLimitRemainingMs() > 0) return "pending";
+      if (systemSleeping || !navigator.onLine || rateLimitRemainingMs() > 0) return "pending";
       if (!isMessengerContentPath(location.pathname)) return "pending";
       if (onFacebookErrorPage()) return "error";
       return realtimeRecovery.status(Date.now());
