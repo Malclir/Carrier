@@ -1,8 +1,11 @@
 {
   "mcpServers": {
     "tauri-mcp": {
-      "command": "node",
-      "args": ["node_modules/tauri-plugin-mcp-server/build/index.js"],
+      "command": "sh",
+      "args": [
+        "-c",
+        "[ -e node_modules/tauri-plugin-mcp-server ] || bun install --frozen-lockfile >&2; exec node node_modules/tauri-plugin-mcp-server/build/index.js"
+      ],
       "env": {
         "TAURI_MCP_IPC_PATH": "/tmp/tauri-mcp.sock"
       }
