@@ -18,7 +18,7 @@ import {
 } from "../lib/realtime-health";
 import { RenderHealthProbe } from "../lib/render-health";
 import { isMessengerContentPath } from "../lib/threads";
-import { SILENT_RECOVERY_RELOAD_EVENT } from "../lib/worker-recovery";
+import { SILENT_RECOVERY_EVENT, SILENT_RECOVERY_RELOAD_EVENT } from "../lib/worker-recovery";
 import {
   hasRateLimitEpisode,
   RATE_LIMIT_EVENT,
@@ -30,6 +30,7 @@ import {
 import { monitorRealtimeHealth } from "./realtime-health";
 import { createSilentRecovery } from "./silent-recovery";
 import { sampleSyncProcessing } from "./sync-processing";
+import { workerRecovery } from "./worker-recovery";
 
 export function initAutoRefresh() {
   // Capture these at document start, before Facebook wraps the scheduling APIs.
@@ -149,6 +150,19 @@ export function initAutoRefresh() {
     return false;
   };
   let rateLimitRetryGrantUntil = 0;
+  // Set once in-place worker repair has failed or cannot act.
+  let silentRecoveryFailed = false;
+  const realtimeReport = () => {
+    const status = realtimeStatus();
+    // An overdue termination or shutdown can still mutate Messenger's worker.
+    // Keep native reload behind that operation until its promise settles.
+    const workerMutationPending =
+      workerRecovery.phase === "dedicated-termination" ||
+      workerRecovery.phase === "shared-shutdown";
+    return ["stale", "never"].includes(status) && (!silentRecoveryFailed || workerMutationPending)
+      ? "managed"
+      : status;
+  };
   const emitHeartbeat = (requestRateLimitRetry = false) => {
     if (typeof heartbeatId !== "number") return;
     const protectedNow = heartbeatProtection();
@@ -175,8 +189,9 @@ export function initAutoRefresh() {
           content_page: isMessengerContentPath(location.pathname),
         },
         // Native supervision still owns unresponsive/blank/error pages. It
-        // must not race a responsive page's non-navigating worker recovery.
-        realtime: ["stale", "never"].includes(realtimeStatus()) ? "managed" : realtimeStatus(),
+        // must not race a responsive page's non-navigating worker recovery,
+        // but takes the transport back as a last resort once that fails.
+        realtime: realtimeReport(),
         rate_limit_ms: rateLimitRemainingMs(),
         rate_limit_account: rateLimitAccountScope(),
         rate_limit_retry: requestRateLimitRetry,
@@ -368,6 +383,10 @@ export function initAutoRefresh() {
 
   window.addEventListener(RATE_LIMIT_RETRY_EVENT, () => schedule(1000, "rate-limit-manual"));
   window.addEventListener(SILENT_RECOVERY_RELOAD_EVENT, () => schedule(0, "manual"));
+  window.addEventListener(SILENT_RECOVERY_EVENT, (event) => {
+    silentRecoveryFailed = (event as CustomEvent<unknown>).detail === true;
+    emitHeartbeat();
+  });
 
   let waitingForRateLimit = rateLimitRemainingMs() > 0;
   window.addEventListener(RATE_LIMIT_EVENT, (event) => {

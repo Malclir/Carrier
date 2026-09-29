@@ -235,6 +235,32 @@ describe("recovery inspection deadlines", () => {
     expect(calls).toHaveLength(1);
   });
 
+  test("a hung replayed setup stays single-flight until its native lifecycle restarts it", async () => {
+    const { f, advance, calls } = stalledDedicated();
+    f.inProgress = false;
+    f.settled = true;
+    f.status = "dedicated_exists";
+    f.termination = async () => {
+      f.settled = false;
+      return true;
+    };
+    f.setupResult = new Promise(() => {});
+    expect(await f.recovery.recover()).toBe("started");
+    expect(f.recovery.previousPhase).toBe("setup");
+    expect(f.setupCalls).toHaveLength(2);
+    // Messenger reports the replayed setup as pending and disconnected.
+    f.inProgress = true;
+    f.bridgePromise = Promise.resolve({ close() {} });
+    f.settled = false;
+    advance(89_999);
+    expect(await f.recovery.recover(() => true, true)).toBe("busy");
+    advance(1);
+    expect(await f.recovery.recover(() => true, true)).toBe("started");
+    expect(calls).toEqual([["carrier-sync-recovery", "dedicated", "carrier_recovery"]]);
+    expect(f.setupCalls).toHaveLength(2);
+    expect(f.terminationCalls).toHaveLength(1);
+  });
+
   test("native lifecycle registration starts a fresh pending-setup grace period", async () => {
     const { f, advance, lifecycle, callback, calls } = stalledDedicated();
     advance(90_000);
@@ -505,6 +531,21 @@ describe("Messenger worker recovery", () => {
     expect(f.setupCalls[1]?.args[0]).toBe(f.args[0]);
     expect(f.args[4]).toBe("mawInit");
     expect(f.watchdogCalls).toHaveLength(0);
+  });
+
+  test("reports a failed recovery when backend reset throws", async () => {
+    const f = fixture();
+    f.setup.getOrSetupWorker(...f.args);
+    const error = new Error("reset failed");
+    f.modules.MAWWaitForBackendSetup = {
+      ...(f.modules.MAWWaitForBackendSetup as object),
+      resetBackendSetup: () => {
+        throw error;
+      },
+    };
+    expect(await f.recovery.recover()).toBe("failed");
+    expect(f.rejected).toEqual([error]);
+    expect(f.setupCalls).toHaveLength(1);
   });
 
   test("uses Messenger's existing callback for a worker that had an identity", async () => {
@@ -878,12 +919,26 @@ describe("Messenger worker recovery", () => {
     });
     const pending = f.recovery.recover();
     expect(await f.recovery.recover()).toBe("busy");
-    await Promise.resolve();
+    expect(await pending).toBe("started");
+    expect(await f.recovery.recover()).toBe("busy");
     const error = new Error("worker failed");
     reject(error);
-    expect(await pending).toBe("started");
+    for (let i = 0; i < 5; i++) await Promise.resolve();
     expect(f.rejected).toEqual([error]);
     expect(f.resets).toBe(1);
+  });
+
+  test("a superseded replay cannot reject Messenger's newer setup", async () => {
+    const f = fixture();
+    f.setup.getOrSetupWorker(...f.args);
+    const replay = Promise.withResolvers<unknown>();
+    f.setupResult = replay.promise;
+    expect(await f.recovery.recover()).toBe("started");
+    f.setupResult = Promise.resolve();
+    f.setup.getOrSetupWorker(...f.args);
+    replay.reject(new Error("late failure"));
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(f.rejected).toHaveLength(0);
   });
 });
 
