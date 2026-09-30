@@ -49,8 +49,34 @@ fn environment_defaults(
     defaults
 }
 
+/// Demote only codecs with a usable software replacement, including the
+/// stateless factory names used before GStreamer 1.24.
+fn nvdec_demotion(mut software_decoder_usable: impl FnMut(&str) -> bool) -> String {
+    let codecs: &[(&str, &[&str])] = &[
+        ("avdec_h264", &["nvh264dec", "nvh264sldec"]),
+        ("avdec_h265", &["nvh265dec", "nvh265sldec"]),
+        ("avdec_av1", &["nvav1dec"]),
+        ("avdec_vp8", &["nvvp8dec", "nvvp8sldec"]),
+        ("avdec_vp9", &["nvvp9dec", "nvvp9sldec"]),
+        ("avdec_mjpeg", &["nvjpegdec"]),
+        ("avdec_mpegvideo", &["nvmpegvideodec"]),
+        ("avdec_mpeg2video", &["nvmpeg2videodec"]),
+        ("avdec_mpeg4", &["nvmpeg4videodec"]),
+    ];
+    codecs
+        .iter()
+        .filter(|(software, _)| software_decoder_usable(software))
+        .flat_map(|(_, hardware)| hardware.iter().map(|name| format!("{name}:NONE")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn configure() {
+    // Apply GTK/WebKit defaults before GStreamer or worker threads start.
+    for (key, value) in environment_defaults(|key| std::env::var_os(key)) {
+        std::env::set_var(key, value);
+    }
     // libsoup 3.6.6's HTTP/2 pool stalled on Messenger with all six connections
     // in CLOSE-WAIT, blocking worker startup too. HTTP/1.1 avoids that failure.
     // Keep an opt-out for testing newer system libraries; see docs/sync-recovery.md.
@@ -60,9 +86,25 @@ pub(crate) fn configure() {
     ) {
         std::env::set_var("SOUP_FORCE_HTTP1", "1");
     }
-    // Called first in run(), before Tauri, GTK, WebKit, or worker threads start.
-    for (key, value) in environment_defaults(|key| std::env::var_os(key)) {
-        std::env::set_var(key, value);
+    // Any NVDEC decoder WebKit can autoplug makes the web process load CUDA
+    // for Messenger clips, even paused offscreen ones: about 100 MB RAM and
+    // 400 MiB VRAM. Only NONE avoids it, which removes NVDEC entirely, so do it
+    // only when the corresponding libav decoder can be created instead.
+    // GStreamer's registry handles user, system, and AppImage plugin paths.
+    // Any explicit GST_PLUGIN_FEATURE_RANK, even empty, opts out.
+    if std::env::var_os("GST_PLUGIN_FEATURE_RANK").is_none() && gstreamer::init().is_ok() {
+        use gstreamer::prelude::*;
+        // The registry lists only features of plugins that loaded when scanned.
+        // Creating an element would load libav into this process for good
+        // (about 35 MB), so a registry lookup is enough.
+        let ranks = nvdec_demotion(|name| {
+            gstreamer::ElementFactory::find(name)
+                .is_some_and(|factory| factory.rank() > gstreamer::Rank::None)
+        });
+        // WebKit's separate web process reads these ranks during its own init.
+        if !ranks.is_empty() {
+            std::env::set_var("GST_PLUGIN_FEATURE_RANK", ranks);
+        }
     }
 }
 
@@ -79,6 +121,15 @@ mod tests {
         for value in ["", "0", "1"] {
             assert!(!should_default_to_http1(Some(value.into()), None));
         }
+    }
+
+    #[test]
+    fn nvdec_ranks_require_a_usable_replacement_for_each_codec() {
+        assert!(nvdec_demotion(|_| false).is_empty());
+        assert_eq!(
+            nvdec_demotion(|name| matches!(name, "avdec_h264" | "avdec_vp9")),
+            "nvh264dec:NONE,nvh264sldec:NONE,nvvp9dec:NONE,nvvp9sldec:NONE"
+        );
     }
 
     fn defaults(values: &[(&str, &str)]) -> Vec<(&'static str, &'static str)> {
