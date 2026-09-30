@@ -40,6 +40,7 @@ mod menu;
 mod notifications;
 mod preflight;
 mod render_recovery;
+mod renderer_memory;
 mod scheduled_send;
 mod settings;
 mod tray;
@@ -306,8 +307,7 @@ fn parse_thread_viewed_payload(payload: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
-fn messenger_url_thread_id(url: &url::Url) -> Option<String> {
+pub(crate) fn messenger_url_thread_id(url: &url::Url) -> Option<String> {
     if !url_rules::is_messenger_web_url(url) {
         return None;
     }

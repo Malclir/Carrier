@@ -490,6 +490,257 @@
     }
   };
 
+  // inject/src/messenger/features/conversation-actions.ts
+  function isShown(el) {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+  function firstShown(sel, root) {
+    for (const el of (root || document).querySelectorAll(sel)) if (isShown(el)) return el;
+    return null;
+  }
+  function buttonByLabel(needles, root) {
+    for (const el of (root || document).querySelectorAll(
+      '[role="button"][aria-label], button[aria-label]'
+    )) {
+      if (!isShown(el)) continue;
+      const label = (el.getAttribute("aria-label") || "").toLowerCase();
+      if (needles.some((n) => label.includes(n))) return el;
+    }
+    return null;
+  }
+  function chatRows() {
+    const seen = /* @__PURE__ */ new Set();
+    const out = [];
+    for (const a of document.querySelectorAll(
+      '[role="grid"] a[href*="/t/"], [role="navigation"] a[href*="/t/"]'
+    )) {
+      const href = a.getAttribute("href");
+      if (!href || seen.has(href)) continue;
+      const r = a.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      seen.add(href);
+      out.push(a);
+    }
+    return out;
+  }
+  function stepConversation(delta) {
+    const rows = chatRows();
+    if (!rows.length) return;
+    const m = location.pathname.match(/\/t\/([^/]+)/);
+    const idx = m ? rows.findIndex((a) => (a.getAttribute("href") || "").includes(`/t/${m[1]}`)) : -1;
+    const nextIdx = idx === -1 ? delta > 0 ? 0 : rows.length - 1 : (idx + delta + rows.length) % rows.length;
+    rows[nextIdx]?.click();
+  }
+  function focusChatSearch() {
+    const input = firstShown('[role="navigation"] input[type="search"]') || firstShown('input[type="search"]');
+    if (input) {
+      input.focus();
+      input.select();
+    }
+    return !!input;
+  }
+  function focusComposer() {
+    const box = firstShown('[role="main"] [contenteditable="true"][role="textbox"]') || firstShown('[contenteditable="true"][data-lexical-editor="true"]');
+    box?.focus();
+    return !!box;
+  }
+  function searchInConvoButton() {
+    const root = document.querySelector('[role="main"]');
+    if (!root) return null;
+    for (const el of root.querySelectorAll('[role="button"][aria-label]')) {
+      if (!isShown(el)) continue;
+      const label = (el.getAttribute("aria-label") || "").trim().toLowerCase();
+      if (label === "search" || label === "search in conversation") return el;
+    }
+    return null;
+  }
+  function searchInConversation() {
+    window.__carrierWakeSearchIndex?.();
+    const btn = searchInConvoButton();
+    if (btn) {
+      btn.click();
+      return true;
+    }
+    if (typeof window.__carrierToggleInfo !== "function" || !window.__carrierToggleInfo())
+      return false;
+    let tries = 0;
+    const timer = setInterval(() => {
+      const b = searchInConvoButton();
+      if (b) {
+        clearInterval(timer);
+        b.click();
+      } else if (++tries >= 40) {
+        clearInterval(timer);
+      }
+    }, 50);
+    return true;
+  }
+  function clickComposerButton(needles) {
+    const root = document.querySelector('[role="main"]');
+    const btn = root && buttonByLabel(needles, root);
+    btn?.click();
+    return !!btn;
+  }
+  var openEmojiPicker = () => clickComposerButton(["choose an emoji"]);
+  var openGifPicker = () => clickComposerButton(["choose a gif"]);
+  var attachFiles = () => clickComposerButton(["attach a photo or video", "attach a file"]);
+  function newConversation() {
+    const link = firstShown('a[href*="/messages/new"]');
+    if (link) {
+      link.click();
+      return true;
+    }
+    const btn = buttonByLabel(["new message"]);
+    if (btn) {
+      btn.click();
+      return true;
+    }
+    location.assign("/messages/new/");
+    return true;
+  }
+
+  // inject/src/messenger/lib/scheduled-composer.ts
+  var COMPOSER_SELECTOR = '[role="main"] [contenteditable="true"][role="textbox"]';
+  var findComposer = () => firstShown(COMPOSER_SELECTOR);
+  var composerText = (box) => box.innerText.replace(/\r\n/g, "\n");
+  function composerRegion(box) {
+    return box.closest('[role="region"], form');
+  }
+  function hasComposerMedia(box) {
+    const region = composerRegion(box);
+    if (!region) return true;
+    if (box.querySelector('img, video, [contenteditable="false"]')) return true;
+    for (const input of region.querySelectorAll('input[type="file"]')) {
+      if (input.files?.length) return true;
+    }
+    for (const media of region.querySelectorAll('img, video, [role="progressbar"]')) {
+      if (!isShown(media)) continue;
+      const control = media.closest('button, [role="button"]');
+      const bounds = control?.getBoundingClientRect();
+      const zoom = Math.min(
+        2,
+        Math.max(0.3, (Number(window.__CARRIER_SETTINGS__?.zoom) || 100) / 100)
+      );
+      if (media.tagName === "IMG" && control && bounds && bounds.width / zoom <= 48 && bounds.height / zoom <= 48 && !control.closest('[contenteditable="true"]'))
+        continue;
+      return true;
+    }
+    return !!buttonByLabel(
+      ["remove attachment", "remove photo", "remove video", "remove file"],
+      region
+    );
+  }
+  function hasComposerDraft() {
+    for (const box of document.querySelectorAll('[contenteditable="true"]')) {
+      if ((box.textContent || "").trim()) return true;
+      if (box.matches(COMPOSER_SELECTOR) && hasComposerMedia(box)) return true;
+    }
+    return false;
+  }
+  function composerControls(box) {
+    const region = composerRegion(box);
+    const controls = /* @__PURE__ */ new Map();
+    if (!region) return controls;
+    for (const button of region.querySelectorAll('button, [role="button"]')) {
+      if (button.hasAttribute("data-carrier-schedule")) continue;
+      controls.set(button, `${button.getAttribute("aria-label") ?? ""}
+${button.innerHTML}`);
+    }
+    return controls;
+  }
+  function findSendButton(box, before) {
+    const region = composerRegion(box);
+    if (!region) return null;
+    const changed = [];
+    for (const button of region.querySelectorAll('button, [role="button"]')) {
+      if (button.hasAttribute("data-carrier-schedule") || !(box.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING) || !isShown(button) || button.getAttribute("aria-disabled") === "true" || button.matches(":disabled"))
+        continue;
+      if (before.get(button) !== `${button.getAttribute("aria-label") ?? ""}
+${button.innerHTML}`)
+        changed.push(button);
+    }
+    return changed.length === 1 ? changed[0] ?? null : null;
+  }
+  function replaceComposerText(box, text) {
+    box.focus();
+    const range = document.createRange();
+    range.selectNodeContents(box);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    return document.execCommand(text ? "insertText" : "delete", false, text);
+  }
+
+  // inject/src/messenger/lib/scheduled-send.ts
+  var SEND_GRACE_MS = 12e4;
+  var MAX_SCHEDULED_CHARS = 2e3;
+  function sendWindow(due, now) {
+    if (now < due) return "early";
+    return now <= due + SEND_GRACE_MS ? "due" : "missed";
+  }
+  function nextDueMessage(items, now) {
+    return items.filter((item) => item.status === "scheduled" && sendWindow(item.due, now) === "due").sort((a, b) => a.due - b.due)[0];
+  }
+  function schedulePresets(now) {
+    const evening = new Date(now);
+    evening.setHours(18, 0, 0, 0);
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(9, 0, 0, 0);
+    return [
+      { label: "In 15 minutes", due: now + 15 * 6e4 },
+      { label: "In 1 hour", due: now + 60 * 6e4 },
+      ...evening.getTime() > now ? [{ label: "This evening", due: evening.getTime() }] : [],
+      { label: "Tomorrow morning", due: tomorrow.getTime() }
+    ];
+  }
+  function localScheduleTime(date, time) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) return null;
+    const value = /* @__PURE__ */ new Date(`${date}T${time}:00`);
+    const [year, month, day] = date.split("-").map(Number);
+    const [hour, minute] = time.split(":").map(Number);
+    if (value.getFullYear() !== year || value.getMonth() + 1 !== month || value.getDate() !== day || value.getHours() !== hour || value.getMinutes() !== minute)
+      return null;
+    return value.getTime();
+  }
+  function localDateValue(time) {
+    const date = new Date(time);
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  }
+  var formatScheduleTime = (time, includeDate = false) => new Intl.DateTimeFormat(void 0, {
+    ...includeDate ? { month: "short", day: "numeric" } : {},
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  }).format(time);
+  var composerBusy = false;
+  var composerWaiters = [];
+  var isComposerDeliveryActive = () => composerBusy;
+  var setComposerBusy = (busy) => {
+    composerBusy = busy;
+    if (typeof window !== "undefined") window.dispatchEvent(new Event("carrier:protection-change"));
+  };
+  async function runComposerDelivery(run) {
+    try {
+      return await run();
+    } finally {
+      const next = composerWaiters.shift();
+      if (next) next();
+      else setComposerBusy(false);
+    }
+  }
+  function withComposerDelivery(run) {
+    if (composerBusy) return Promise.resolve(void 0);
+    setComposerBusy(true);
+    return runComposerDelivery(run);
+  }
+  async function withComposerDeliveryWhenAvailable(run) {
+    if (composerBusy) await new Promise((resolve) => composerWaiters.push(resolve));
+    else setComposerBusy(true);
+    return runComposerDelivery(run);
+  }
+
   // inject/src/messenger/lib/threads.ts
   function threadIdFromHref(href) {
     const m = (href || "").match(/\/t\/(\d+)/);
@@ -1835,15 +2086,6 @@
       clearTimeout(timer);
       timer = void 0;
     };
-    const composerHasText = () => {
-      try {
-        for (const el of document.querySelectorAll('[contenteditable="true"]')) {
-          if ((el.textContent || "").trim().length > 0) return true;
-        }
-      } catch (_) {
-      }
-      return false;
-    };
     const heartbeatId = window.__CARRIER_HEARTBEAT_ID__;
     try {
       delete window.__CARRIER_HEARTBEAT_ID__;
@@ -1851,7 +2093,7 @@
       window.__CARRIER_HEARTBEAT_ID__ = void 0;
     }
     let lastHeartbeatProtection;
-    const heartbeatProtection = () => composerHasText() || !!window.__carrierInCall;
+    const heartbeatProtection = () => isComposerDeliveryActive() || hasComposerDraft() || !!window.__carrierInCall;
     const realtimeRecovery = new RealtimeRecoveryTracker(Date.now());
     const onFacebookErrorPage = () => {
       try {
@@ -1970,7 +2212,7 @@
         clearPending();
         return;
       }
-      if (composerHasText() || window.__carrierInCall) {
+      if (heartbeatProtection()) {
         timer = setTimeout(maybeReload, 8e3);
         return;
       }
@@ -7142,116 +7384,6 @@
     return ignoresMuted && !conversationListTrustworthy ? previousFilteredCount : unreadConversations;
   }
 
-  // inject/src/messenger/features/conversation-actions.ts
-  function isShown(el) {
-    const r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0;
-  }
-  function firstShown(sel, root) {
-    for (const el of (root || document).querySelectorAll(sel)) if (isShown(el)) return el;
-    return null;
-  }
-  function buttonByLabel(needles, root) {
-    for (const el of (root || document).querySelectorAll(
-      '[role="button"][aria-label], button[aria-label]'
-    )) {
-      if (!isShown(el)) continue;
-      const label = (el.getAttribute("aria-label") || "").toLowerCase();
-      if (needles.some((n) => label.includes(n))) return el;
-    }
-    return null;
-  }
-  function chatRows() {
-    const seen = /* @__PURE__ */ new Set();
-    const out = [];
-    for (const a of document.querySelectorAll(
-      '[role="grid"] a[href*="/t/"], [role="navigation"] a[href*="/t/"]'
-    )) {
-      const href = a.getAttribute("href");
-      if (!href || seen.has(href)) continue;
-      const r = a.getBoundingClientRect();
-      if (r.width === 0 || r.height === 0) continue;
-      seen.add(href);
-      out.push(a);
-    }
-    return out;
-  }
-  function stepConversation(delta) {
-    const rows = chatRows();
-    if (!rows.length) return;
-    const m = location.pathname.match(/\/t\/([^/]+)/);
-    const idx = m ? rows.findIndex((a) => (a.getAttribute("href") || "").includes(`/t/${m[1]}`)) : -1;
-    const nextIdx = idx === -1 ? delta > 0 ? 0 : rows.length - 1 : (idx + delta + rows.length) % rows.length;
-    rows[nextIdx]?.click();
-  }
-  function focusChatSearch() {
-    const input = firstShown('[role="navigation"] input[type="search"]') || firstShown('input[type="search"]');
-    if (input) {
-      input.focus();
-      input.select();
-    }
-    return !!input;
-  }
-  function focusComposer() {
-    const box = firstShown('[role="main"] [contenteditable="true"][role="textbox"]') || firstShown('[contenteditable="true"][data-lexical-editor="true"]');
-    box?.focus();
-    return !!box;
-  }
-  function searchInConvoButton() {
-    const root = document.querySelector('[role="main"]');
-    if (!root) return null;
-    for (const el of root.querySelectorAll('[role="button"][aria-label]')) {
-      if (!isShown(el)) continue;
-      const label = (el.getAttribute("aria-label") || "").trim().toLowerCase();
-      if (label === "search" || label === "search in conversation") return el;
-    }
-    return null;
-  }
-  function searchInConversation() {
-    window.__carrierWakeSearchIndex?.();
-    const btn = searchInConvoButton();
-    if (btn) {
-      btn.click();
-      return true;
-    }
-    if (typeof window.__carrierToggleInfo !== "function" || !window.__carrierToggleInfo())
-      return false;
-    let tries = 0;
-    const timer = setInterval(() => {
-      const b = searchInConvoButton();
-      if (b) {
-        clearInterval(timer);
-        b.click();
-      } else if (++tries >= 40) {
-        clearInterval(timer);
-      }
-    }, 50);
-    return true;
-  }
-  function clickComposerButton(needles) {
-    const root = document.querySelector('[role="main"]');
-    const btn = root && buttonByLabel(needles, root);
-    btn?.click();
-    return !!btn;
-  }
-  var openEmojiPicker = () => clickComposerButton(["choose an emoji"]);
-  var openGifPicker = () => clickComposerButton(["choose a gif"]);
-  var attachFiles = () => clickComposerButton(["attach a photo or video", "attach a file"]);
-  function newConversation() {
-    const link = firstShown('a[href*="/messages/new"]');
-    if (link) {
-      link.click();
-      return true;
-    }
-    const btn = buttonByLabel(["new message"]);
-    if (btn) {
-      btn.click();
-      return true;
-    }
-    location.assign("/messages/new/");
-    return true;
-  }
-
   // inject/src/messenger/features/notifications.ts
   var FALLBACK_DELAY_MS = 2500;
   var PAGE_NOTIFICATION_MATCH_MS = 3e3;
@@ -8551,135 +8683,6 @@
   var composerContainsReply = (content, reply) => reply.length > 0 && (content || "").replace(/\r\n/g, "\n") === reply.replace(/\r\n/g, "\n");
   var composerIncludesReply = (content, reply) => reply.length > 0 && (content || "").replace(/\r\n/g, "\n").includes(reply.replace(/\r\n/g, "\n"));
 
-  // inject/src/messenger/lib/scheduled-composer.ts
-  var COMPOSER_SELECTOR = '[role="main"] [contenteditable="true"][role="textbox"]';
-  var findComposer = () => firstShown(COMPOSER_SELECTOR);
-  var composerText = (box) => box.innerText.replace(/\r\n/g, "\n");
-  function composerRegion(box) {
-    return box.closest('[role="region"], form');
-  }
-  function hasComposerMedia(box) {
-    const region = composerRegion(box);
-    if (!region) return true;
-    if (box.querySelector('img, video, [contenteditable="false"]')) return true;
-    for (const input of region.querySelectorAll('input[type="file"]')) {
-      if (input.files?.length) return true;
-    }
-    for (const media of region.querySelectorAll('img, video, [role="progressbar"]')) {
-      if (!isShown(media)) continue;
-      const control = media.closest('button, [role="button"]');
-      const bounds = control?.getBoundingClientRect();
-      const zoom = Math.min(
-        2,
-        Math.max(0.3, (Number(window.__CARRIER_SETTINGS__?.zoom) || 100) / 100)
-      );
-      if (media.tagName === "IMG" && control && bounds && bounds.width / zoom <= 48 && bounds.height / zoom <= 48 && !control.closest('[contenteditable="true"]'))
-        continue;
-      return true;
-    }
-    return !!buttonByLabel(
-      ["remove attachment", "remove photo", "remove video", "remove file"],
-      region
-    );
-  }
-  function composerControls(box) {
-    const region = composerRegion(box);
-    const controls = /* @__PURE__ */ new Map();
-    if (!region) return controls;
-    for (const button of region.querySelectorAll('button, [role="button"]')) {
-      if (button.hasAttribute("data-carrier-schedule")) continue;
-      controls.set(button, `${button.getAttribute("aria-label") ?? ""}
-${button.innerHTML}`);
-    }
-    return controls;
-  }
-  function findSendButton(box, before) {
-    const region = composerRegion(box);
-    if (!region) return null;
-    const changed = [];
-    for (const button of region.querySelectorAll('button, [role="button"]')) {
-      if (button.hasAttribute("data-carrier-schedule") || !(box.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING) || !isShown(button) || button.getAttribute("aria-disabled") === "true" || button.matches(":disabled"))
-        continue;
-      if (before.get(button) !== `${button.getAttribute("aria-label") ?? ""}
-${button.innerHTML}`)
-        changed.push(button);
-    }
-    return changed.length === 1 ? changed[0] ?? null : null;
-  }
-  function replaceComposerText(box, text) {
-    box.focus();
-    const range = document.createRange();
-    range.selectNodeContents(box);
-    const selection = window.getSelection();
-    selection?.removeAllRanges();
-    selection?.addRange(range);
-    return document.execCommand(text ? "insertText" : "delete", false, text);
-  }
-
-  // inject/src/messenger/lib/scheduled-send.ts
-  var SEND_GRACE_MS = 12e4;
-  var MAX_SCHEDULED_CHARS = 2e3;
-  function sendWindow(due, now) {
-    if (now < due) return "early";
-    return now <= due + SEND_GRACE_MS ? "due" : "missed";
-  }
-  function nextDueMessage(items, now) {
-    return items.filter((item) => item.status === "scheduled" && sendWindow(item.due, now) === "due").sort((a, b) => a.due - b.due)[0];
-  }
-  function schedulePresets(now) {
-    const evening = new Date(now);
-    evening.setHours(18, 0, 0, 0);
-    const tomorrow = new Date(now);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    tomorrow.setHours(9, 0, 0, 0);
-    return [
-      { label: "In 15 minutes", due: now + 15 * 6e4 },
-      { label: "In 1 hour", due: now + 60 * 6e4 },
-      ...evening.getTime() > now ? [{ label: "This evening", due: evening.getTime() }] : [],
-      { label: "Tomorrow morning", due: tomorrow.getTime() }
-    ];
-  }
-  function localScheduleTime(date, time) {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) return null;
-    const value = /* @__PURE__ */ new Date(`${date}T${time}:00`);
-    const [year, month, day] = date.split("-").map(Number);
-    const [hour, minute] = time.split(":").map(Number);
-    if (value.getFullYear() !== year || value.getMonth() + 1 !== month || value.getDate() !== day || value.getHours() !== hour || value.getMinutes() !== minute)
-      return null;
-    return value.getTime();
-  }
-  function localDateValue(time) {
-    const date = new Date(time);
-    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-  }
-  var formatScheduleTime = (time, includeDate = false) => new Intl.DateTimeFormat(void 0, {
-    ...includeDate ? { month: "short", day: "numeric" } : {},
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23"
-  }).format(time);
-  var composerBusy = false;
-  var composerWaiters = [];
-  async function runComposerDelivery(run) {
-    try {
-      return await run();
-    } finally {
-      const next = composerWaiters.shift();
-      if (next) next();
-      else composerBusy = false;
-    }
-  }
-  function withComposerDelivery(run) {
-    if (composerBusy) return Promise.resolve(void 0);
-    composerBusy = true;
-    return runComposerDelivery(run);
-  }
-  async function withComposerDeliveryWhenAvailable(run) {
-    if (composerBusy) await new Promise((resolve) => composerWaiters.push(resolve));
-    else composerBusy = true;
-    return runComposerDelivery(run);
-  }
-
   // inject/src/messenger/features/quick-reply.ts
   var POLL_MS = 250;
   var DELIVERY_BUDGET_MS = 12e3;
@@ -9911,6 +9914,166 @@ ${text}`)) {
     });
   }
 
+  // inject/src/messenger/lib/thread-restore.ts
+  var THREAD_RESTORE_WAIT_MS = 3e4;
+  function threadRestoreStep(input) {
+    if (input.done || input.onThread) return "done";
+    if (input.waitedMs >= THREAD_RESTORE_WAIT_MS) return "load";
+    return input.rowFound ? "click" : "wait";
+  }
+
+  // inject/src/messenger/lib/thread-viewed.ts
+  var initialThreadViewedState = () => ({
+    visible: false,
+    threadPath: null,
+    lastReportedAt: null
+  });
+  var THREAD_VIEW_RECHECK_MS = 5e3;
+  function advanceThreadViewed(previous, threadPath, visible, now) {
+    const active = visible && threadPath !== null;
+    const changed = !previous.visible || previous.threadPath !== threadPath;
+    const recheckDue = active && previous.lastReportedAt !== null && Number.isFinite(now) && now >= previous.lastReportedAt + THREAD_VIEW_RECHECK_MS;
+    const emit = active && (changed || recheckDue) ? threadPath : null;
+    return {
+      state: {
+        visible,
+        threadPath,
+        lastReportedAt: emit ? now : active ? previous.lastReportedAt : null
+      },
+      emit
+    };
+  }
+
+  // inject/src/messenger/features/thread-nav.ts
+  var RESTORED_THREAD_KEY = "carrier-restored-thread";
+  var cancelThreadRestore = () => {
+  };
+  function stopThreadRestore() {
+    cancelThreadRestore();
+  }
+  function restoreRecycledThread(id) {
+    const startedAt = Date.now();
+    let cancelled = false;
+    let lastThread = threadIdFromHref(location.pathname);
+    const markDone = () => {
+      try {
+        sessionStorage.setItem(RESTORED_THREAD_KEY, id);
+      } catch (_) {
+      }
+    };
+    cancelThreadRestore = () => {
+      cancelled = true;
+      markDone();
+    };
+    const onUserInput = (event) => {
+      if (event.isTrusted) cancelThreadRestore();
+    };
+    for (const type of ["pointerdown", "keydown"]) {
+      window.addEventListener(type, onUserInput, true);
+    }
+    const attempt = () => {
+      if (cancelled) return;
+      const current = threadIdFromHref(location.pathname);
+      if (lastThread && current !== lastThread && current !== id) {
+        cancelThreadRestore();
+        return;
+      }
+      lastThread = current ?? lastThread;
+      let done = false;
+      try {
+        done = sessionStorage.getItem(RESTORED_THREAD_KEY) === id;
+      } catch (_) {
+      }
+      const row = [
+        ...document.querySelectorAll('[role="navigation"] a[href*="/t/"]')
+      ].find((a) => threadIdFromHref(a.getAttribute("href")) === id);
+      const step = threadRestoreStep({
+        done,
+        onThread: current === id,
+        rowFound: !!row,
+        waitedMs: Date.now() - startedAt
+      });
+      if (step === "done") {
+        if (!done) markDone();
+        return;
+      }
+      if (step === "load") {
+        markDone();
+        location.href = `https://www.facebook.com/messages/t/${id}/`;
+        return;
+      }
+      if (step === "click") row?.click();
+      setTimeout(attempt, 500);
+    };
+    attempt();
+  }
+  function initThreadNav() {
+    setTimeout(() => {
+      const restoreId = window.__CARRIER_RESTORE_THREAD__;
+      if (typeof restoreId === "string" && /^\d{1,32}$/.test(restoreId)) {
+        restoreRecycledThread(restoreId);
+      }
+    }, 0);
+    window.__carrierOpenThread = (href) => {
+      const id = threadPathId(href);
+      if (!id) return false;
+      cancelThreadRestore();
+      for (const a of document.querySelectorAll('a[href*="/t/"]')) {
+        if (threadIdFromHref(a.getAttribute("href")) === id) {
+          a.click();
+          return true;
+        }
+      }
+      location.href = `https://www.facebook.com/messages/t/${id}/`;
+      return true;
+    };
+    let viewed = initialThreadViewedState();
+    const reportViewedThread = () => {
+      const id = threadIdFromHref(location.pathname);
+      const path = id ? `/t/${id}/` : null;
+      const next = advanceThreadViewed(
+        viewed,
+        path,
+        document.hasFocus() && !document.hidden,
+        performance.now()
+      );
+      viewed = next.state;
+      if (next.emit) {
+        invoke("plugin:event|emit", {
+          event: "carrier:thread-viewed",
+          payload: { thread_path: next.emit }
+        })?.catch?.(() => diag("thread-viewed.emit", "thread view emit failed"));
+      }
+    };
+    setInterval(reportViewedThread, 1e3);
+    document.addEventListener("visibilitychange", reportViewedThread);
+    window.addEventListener("focus", reportViewedThread);
+    window.addEventListener("blur", reportViewedThread);
+    reportViewedThread();
+    window.__carrierToggleInfo = () => {
+      const wanted = (el) => {
+        const l = (el.getAttribute("aria-label") || "").toLowerCase();
+        return l.includes("conversation information") || l.includes("conversation details");
+      };
+      let btn = document.querySelector(
+        '[role="button"][aria-label="Conversation information"]'
+      );
+      if (!btn) {
+        for (const el of document.querySelectorAll("[aria-label]"))
+          if (wanted(el)) {
+            btn = el.closest('[role="button"]') || el;
+            break;
+          }
+      }
+      if (btn) {
+        btn.click();
+        return true;
+      }
+      toast("Open a conversation first");
+      return false;
+    };
+  }
+
   // inject/src/messenger/lib/zoom.ts
   var clampZoom = (p) => Math.min(200, Math.max(30, Math.round(p) || 100));
 
@@ -10047,7 +10210,7 @@ ${text}`)) {
     );
   }
   function initShortcutRegistry() {
-    window.__carrierShortcuts = {
+    const actions = {
       nextConversation: () => stepConversation(1),
       prevConversation: () => stepConversation(-1),
       focusChatSearch,
@@ -10058,6 +10221,15 @@ ${text}`)) {
       attachFiles,
       newConversation
     };
+    window.__carrierShortcuts = Object.fromEntries(
+      Object.entries(actions).map(([name, action2]) => [
+        name,
+        () => {
+          stopThreadRestore();
+          return action2();
+        }
+      ])
+    );
   }
 
   // inject/src/messenger/features/spellcheck.ts
@@ -10632,89 +10804,6 @@ ${text}`)) {
       };
     } catch (_) {
     }
-  }
-
-  // inject/src/messenger/lib/thread-viewed.ts
-  var initialThreadViewedState = () => ({
-    visible: false,
-    threadPath: null,
-    lastReportedAt: null
-  });
-  var THREAD_VIEW_RECHECK_MS = 5e3;
-  function advanceThreadViewed(previous, threadPath, visible, now) {
-    const active = visible && threadPath !== null;
-    const changed = !previous.visible || previous.threadPath !== threadPath;
-    const recheckDue = active && previous.lastReportedAt !== null && Number.isFinite(now) && now >= previous.lastReportedAt + THREAD_VIEW_RECHECK_MS;
-    const emit = active && (changed || recheckDue) ? threadPath : null;
-    return {
-      state: {
-        visible,
-        threadPath,
-        lastReportedAt: emit ? now : active ? previous.lastReportedAt : null
-      },
-      emit
-    };
-  }
-
-  // inject/src/messenger/features/thread-nav.ts
-  function initThreadNav() {
-    window.__carrierOpenThread = (href) => {
-      const id = threadPathId(href);
-      if (!id) return false;
-      for (const a of document.querySelectorAll('a[href*="/t/"]')) {
-        if (threadIdFromHref(a.getAttribute("href")) === id) {
-          a.click();
-          return true;
-        }
-      }
-      location.href = `https://www.facebook.com/messages/t/${id}/`;
-      return true;
-    };
-    let viewed = initialThreadViewedState();
-    const reportViewedThread = () => {
-      const id = threadIdFromHref(location.pathname);
-      const path = id ? `/t/${id}/` : null;
-      const next = advanceThreadViewed(
-        viewed,
-        path,
-        document.hasFocus() && !document.hidden,
-        performance.now()
-      );
-      viewed = next.state;
-      if (next.emit) {
-        invoke("plugin:event|emit", {
-          event: "carrier:thread-viewed",
-          payload: { thread_path: next.emit }
-        })?.catch?.(() => diag("thread-viewed.emit", "thread view emit failed"));
-      }
-    };
-    setInterval(reportViewedThread, 1e3);
-    document.addEventListener("visibilitychange", reportViewedThread);
-    window.addEventListener("focus", reportViewedThread);
-    window.addEventListener("blur", reportViewedThread);
-    reportViewedThread();
-    window.__carrierToggleInfo = () => {
-      const wanted = (el) => {
-        const l = (el.getAttribute("aria-label") || "").toLowerCase();
-        return l.includes("conversation information") || l.includes("conversation details");
-      };
-      let btn = document.querySelector(
-        '[role="button"][aria-label="Conversation information"]'
-      );
-      if (!btn) {
-        for (const el of document.querySelectorAll("[aria-label]"))
-          if (wanted(el)) {
-            btn = el.closest('[role="button"]') || el;
-            break;
-          }
-      }
-      if (btn) {
-        btn.click();
-        return true;
-      }
-      toast("Open a conversation first");
-      return false;
-    };
   }
 
   // inject/src/messenger/features/unread-badge.ts

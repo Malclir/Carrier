@@ -17,10 +17,14 @@ use crate::render_recovery::{
     RenderAction, RenderHeartbeat, RenderRecovery, RenderRecoveryBudget, RenderSignal,
     RenderWindowState,
 };
+use crate::renderer_memory::RendererMemory;
 use crate::url_rules::{is_messenger_content_url, is_messenger_web_url};
 use crate::MESSENGER_DNS_TIMEOUT;
 
 const HEARTBEAT_EVENT: &str = "carrier:webview-heartbeat";
+
+#[cfg(target_os = "linux")]
+static MEMORY_WINDOW_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn hold_failures(window: &WebviewWindow) -> bool {
     window
@@ -465,6 +469,9 @@ struct WatchdogState {
     error_reload_pending: bool,
     error_clear_since: Option<Duration>,
     render: RenderRecovery,
+    memory: RendererMemory,
+    #[cfg(target_os = "linux")]
+    memory_window_generation: u64,
 }
 
 impl WatchdogState {
@@ -610,6 +617,7 @@ impl WatchdogState {
     fn navigation_started(&mut self, now: Duration) {
         self.navigation_started_at = Some(now);
         self.render.pause(now);
+        self.memory.pause();
     }
 
     fn unresponsive_action(&self) -> WatchdogAction {
@@ -632,6 +640,7 @@ impl WatchdogState {
     #[cfg(any(target_os = "macos", test))]
     fn system_resumed(&mut self, now: Duration) {
         self.render.pause(now);
+        self.memory.pause();
         // Pre-sleep ages say nothing about the newly woken renderer. Give it a
         // fresh heartbeat window, then fall back to a reload if it cannot
         // answer. Recovery attempt budgets remain intact across sleep.
@@ -668,6 +677,7 @@ impl WatchdogState {
     }
 
     fn disarm(&mut self) {
+        self.memory.pause();
         self.last_heartbeat_at = None;
         self.system_resumed_at = None;
         self.navigation_started_at = None;
@@ -731,6 +741,8 @@ impl WebviewWatchdog {
     /// into a reload loop. A destroyed window stops its task; this matters when a
     /// macOS theme change rebuilds a window under the same label.
     pub(crate) fn install(&self, window: &WebviewWindow) {
+        #[cfg(target_os = "linux")]
+        MEMORY_WINDOW_GENERATION.fetch_add(1, Ordering::Relaxed);
         let watchdog_id = self.id;
         REALTIME_RECREATE_BUDGET
             .lock()
@@ -791,9 +803,25 @@ impl WebviewWatchdog {
                 payload.content_present,
                 payload.realtime,
             );
+            let healthy = payload.realtime == Some(RealtimeSignal::Ok) && !cooling_down;
+            memory_sampling_available(&listener_window, &mut state);
+            match &payload.render {
+                Some(render) if render.content_page => state.memory.heartbeat(
+                    started_at.elapsed(),
+                    render.document_epoch_ms,
+                    healthy
+                        && payload.content_present == Some(true)
+                        && (render.state == RenderSignal::Ok
+                            || (!native_window.visible
+                                && !render.visible
+                                && render.state == RenderSignal::Pending))
+                        && !payload.protected
+                        && payload.rate_limit_ms.unwrap_or(0) == 0,
+                ),
+                _ => state.memory.pause(),
+            }
             let reload_recovered = !state.error_reload_pending;
             drop(state);
-            let healthy = payload.realtime == Some(RealtimeSignal::Ok) && !cooling_down;
             let rebuild_recovered = REALTIME_RECREATE_BUDGET.lock().unwrap().observe(
                 listener_window.label(),
                 watchdog_id,
@@ -846,6 +874,8 @@ impl WebviewWatchdog {
         let destroyed_label = window.label().to_owned();
         window.on_window_event(move |event| {
             if matches!(event, WindowEvent::Destroyed) {
+                #[cfg(target_os = "linux")]
+                MEMORY_WINDOW_GENERATION.fetch_add(1, Ordering::Relaxed);
                 window_alive.store(false, Ordering::Release);
                 REALTIME_RECREATE_BUDGET
                     .lock()
@@ -853,11 +883,11 @@ impl WebviewWatchdog {
                     .window_destroyed(&destroyed_label, watchdog_id);
             }
             if matches!(event, WindowEvent::Focused(_)) {
-                focus_state
-                    .lock()
-                    .unwrap()
-                    .render
-                    .pause(started_at.elapsed());
+                let mut state = focus_state.lock().unwrap();
+                state.render.pause(started_at.elapsed());
+                if matches!(event, WindowEvent::Focused(true)) {
+                    state.memory.focused();
+                }
             }
         });
 
@@ -919,10 +949,19 @@ impl WebviewWatchdog {
                     state
                         .render
                         .window_changed(started_at.elapsed(), native_window);
+                    state.memory.window(
+                        started_at.elapsed(),
+                        native_window.visible,
+                        native_window.focused,
+                    );
                     state.action(started_at.elapsed())
                 };
                 match action {
-                    WatchdogAction::None | WatchdogAction::Protected => {
+                    WatchdogAction::None => {
+                        held_reported = false;
+                        recycle_idle_renderer(&watchdog_window, &state, started_at, &label).await;
+                    }
+                    WatchdogAction::Protected => {
                         held_reported = false;
                     }
                     WatchdogAction::RenderExhausted => {
@@ -1241,6 +1280,7 @@ impl WebviewWatchdog {
                                     &label,
                                     render_budget.clone(),
                                     refund,
+                                    None,
                                 ) {
                                     // Keep supervising until the async rebuild
                                     // actually destroys this window. If destroy
@@ -1274,6 +1314,212 @@ impl WebviewWatchdog {
     }
 }
 
+/// Linux's aggregate footprint is attributable only with one Messenger window.
+fn memory_sampling_available(window: &WebviewWindow, state: &mut WatchdogState) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let generation = MEMORY_WINDOW_GENERATION.load(Ordering::Relaxed);
+        if state.memory_window_generation != generation {
+            state.memory.pause();
+            state.memory_window_generation = generation;
+        }
+        if window
+            .app_handle()
+            .webview_windows()
+            .keys()
+            .filter(|label| label.as_str() != "settings")
+            .count()
+            != 1
+        {
+            state.memory.pause();
+            return false;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (window, state);
+    true
+}
+
+impl WatchdogState {
+    fn memory_restart_ready(&self, now: Duration, document_epoch_ms: u64) -> bool {
+        self.memory.document_epoch() == Some(document_epoch_ms)
+            && self.memory.ready(now)
+            && self.missing_content_since.is_none()
+            && self.navigation_started_at.is_none()
+            && !self.error_reload_pending
+            && self.render.action(now, self.protected).is_none()
+            && self.action(now) == WatchdogAction::None
+    }
+}
+
+/// Revalidate on the main thread immediately before changing the webview.
+pub(crate) struct RendererRecycle {
+    state: Arc<Mutex<WatchdogState>>,
+    started_at: Instant,
+    document_epoch_ms: u64,
+    baseline: u64,
+    footprint: u64,
+    #[cfg(target_os = "macos")]
+    resume_generation: u64,
+}
+
+impl RendererRecycle {
+    pub(crate) fn run<T>(
+        &self,
+        window: &WebviewWindow,
+        require_hidden: bool,
+        operation: impl FnOnce() -> T,
+    ) -> Option<T> {
+        #[cfg(target_os = "macos")]
+        if crate::macos::power::is_system_sleeping()
+            || crate::macos::power::resume_generation() != self.resume_generation
+        {
+            return None;
+        }
+        window.url().ok().filter(is_messenger_content_url)?;
+        let native_window = render_window_state(window);
+        if require_hidden && native_window.visible {
+            return None;
+        }
+        let now = self.started_at.elapsed();
+        let mut state = self.state.lock().unwrap();
+        state
+            .memory
+            .window(now, native_window.visible, native_window.focused);
+        if !memory_sampling_available(window, &mut state)
+            || !state.memory_restart_ready(now, self.document_epoch_ms)
+        {
+            return None;
+        }
+        let coordinator = recovery_coordinator().lock().unwrap();
+        if coordinator.blocked(&state.rate_limit_account, RecoveryTime::now()) {
+            return None;
+        }
+        state.navigation_started(now);
+        log::info!(
+            "Messenger renderer {} grew from {} to {} MiB while idle; {} it to release memory",
+            window.label(),
+            self.baseline / (1024 * 1024),
+            self.footprint / (1024 * 1024),
+            if require_hidden {
+                "rebuilding"
+            } else {
+                "restarting"
+            },
+        );
+        // This main-thread callback does not yield before the operation. Release
+        // the locks so synchronous page-load callbacks can take them again.
+        drop(coordinator);
+        drop(state);
+        Some(operation())
+    }
+}
+
+/// Unlike failure recovery, recycling is optional: any doubt skips this tick.
+async fn recycle_idle_renderer(
+    window: &WebviewWindow,
+    state: &Arc<Mutex<WatchdogState>>,
+    started_at: Instant,
+    label: &str,
+) {
+    let document_epoch_ms = {
+        let mut state = state.lock().unwrap();
+        if !memory_sampling_available(window, &mut state)
+            || !state.memory.wants_sample(started_at.elapsed())
+        {
+            return;
+        }
+        let Some(epoch) = state.memory.document_epoch() else {
+            return;
+        };
+        epoch
+    };
+    #[cfg(target_os = "macos")]
+    let resume_generation = crate::macos::power::resume_generation();
+    let Some(footprint) = crate::renderer_memory::footprint(window).await else {
+        return;
+    };
+    let baseline = {
+        let mut state = state.lock().unwrap();
+        if !memory_sampling_available(window, &mut state) {
+            return;
+        }
+        state
+            .memory
+            .sampled(started_at.elapsed(), document_epoch_ms, footprint)
+    };
+    let Some(baseline) = baseline else {
+        return;
+    };
+    // Pending content and frame failures also veto the final restart, even
+    // before their confirmation timers would produce a watchdog action.
+    let account = state.lock().unwrap().rate_limit_account.clone();
+    if recovery_coordinator()
+        .lock()
+        .unwrap()
+        .blocked(&account, RecoveryTime::now())
+        || !window.url().is_ok_and(|url| is_messenger_content_url(&url))
+    {
+        return;
+    }
+    // A reload while Facebook is unreachable strands WebKit on its error page.
+    let reachable = matches!(
+        tokio::time::timeout(
+            MESSENGER_DNS_TIMEOUT,
+            tauri::async_runtime::spawn_blocking(messenger_dns_preflight)
+        )
+        .await,
+        Ok(Ok(Ok(())))
+    );
+    #[cfg(target_os = "macos")]
+    if crate::macos::power::is_system_sleeping()
+        || crate::macos::power::resume_generation() != resume_generation
+    {
+        return;
+    }
+    if !reachable {
+        return;
+    }
+    let recycle = RendererRecycle {
+        state: Arc::clone(state),
+        started_at,
+        document_epoch_ms,
+        baseline,
+        footprint,
+        #[cfg(target_os = "macos")]
+        resume_generation,
+    };
+    let window = window.clone();
+    let label = label.to_owned();
+    let app = window.app_handle().clone();
+    let _ = app.run_on_main_thread(move || {
+        if render_window_state(&window).visible {
+            // The sample may predate the window being shown; a visible reload
+            // needs leak-level growth.
+            if !crate::renderer_memory::warrants_replacement(
+                recycle.baseline,
+                recycle.footprint,
+                false,
+            ) {
+                return;
+            }
+            recycle.run(&window, false, || {
+                crate::actions::messenger_page_started(&window);
+                crate::renderer_memory::restart_in_place(&window);
+            });
+        } else {
+            let render_budget = recycle.state.lock().unwrap().render.budget();
+            crate::window::recreate_messenger_window(
+                window.app_handle(),
+                &label,
+                render_budget,
+                None,
+                Some(recycle),
+            );
+        }
+    });
+}
+
 fn render_window_state(window: &WebviewWindow) -> RenderWindowState {
     RenderWindowState {
         visible: window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(true),
@@ -1284,6 +1530,54 @@ fn render_window_state(window: &WebviewWindow) -> RenderWindowState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_restart_waits_for_fresh_health_after_resume() {
+        let mut state = WatchdogState::default();
+        state.memory.heartbeat(Duration::ZERO, 1, true);
+        state.memory.window(Duration::ZERO, false, false);
+        let resumed_at = Duration::from_secs(3600);
+        state.heartbeat(resumed_at, false, Some(true), Some(RealtimeSignal::Ok));
+        assert!(state.memory.wants_sample(resumed_at));
+        assert!(state.memory_restart_ready(resumed_at, 1));
+
+        state.system_resumed(resumed_at);
+        let now = resumed_at + PING_INTERVAL;
+        assert_eq!(state.action(now), WatchdogAction::None);
+        assert!(!state.memory.wants_sample(now));
+        assert!(!state.memory_restart_ready(now, 1));
+
+        state.heartbeat(now, false, Some(true), Some(RealtimeSignal::Pending));
+        state.memory.heartbeat(now, 1, false);
+        assert!(!state.memory_restart_ready(now, 1));
+
+        state.heartbeat(now, false, Some(true), Some(RealtimeSignal::Ok));
+        state.memory.heartbeat(now, 1, true);
+        assert!(state.memory_restart_ready(now, 1));
+        // Resume starts a fresh settling interval before measuring again.
+        assert!(!state.memory.wants_sample(now));
+        assert!(state.memory.wants_sample(now + Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn memory_restart_preserves_pending_blank_and_render_failures() {
+        let now = Duration::from_secs(3600);
+        let mut state = WatchdogState::default();
+        state.memory.heartbeat(Duration::ZERO, 1, true);
+        state.memory.window(Duration::ZERO, false, false);
+        assert!(state.memory_restart_ready(now, 1));
+        assert!(!state.memory_restart_ready(now, 2));
+
+        state.missing_content_since = Some(now);
+        assert_eq!(state.action(now), WatchdogAction::None);
+        assert!(!state.memory_restart_ready(now, 1));
+
+        state.missing_content_since = None;
+        state.render.reload_started(now);
+        assert_eq!(state.render.action(now, false), Some(RenderAction::Wait));
+        assert_eq!(state.action(now), WatchdogAction::None);
+        assert!(!state.memory_restart_ready(now, 1));
+    }
 
     #[test]
     fn responsive_heartbeats_cannot_reset_or_bypass_frame_recovery() {
