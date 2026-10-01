@@ -1283,6 +1283,8 @@ impl QuickReplyWorkerSlots {
         }
     }
 
+    // `fetch_update` is deprecated in favor of `try_update`, which is newer than the MSRV.
+    #[allow(deprecated)]
     fn try_acquire(&self) -> Option<QuickReplyWorkerPermit<'_>> {
         self.active
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
