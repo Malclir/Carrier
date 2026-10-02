@@ -11,7 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -65,6 +65,90 @@ pub(crate) struct NotifyMsg {
     /// Kept native-side so notification clicks still work after a page reload.
     #[serde(default)]
     thread_path: String,
+    /// Messenger's UI language is English. Older page bundles omit it.
+    #[serde(default)]
+    english_ui: bool,
+    /// The message's raw text (before link or photo rewording), which 👍
+    /// matches the conversation's bubble by. Never shown.
+    #[serde(default)]
+    match_body: String,
+    /// The signed-in Facebook account the notification arrived for.
+    #[serde(default)]
+    account: String,
+}
+
+/// What a shown notification announced, for its 👍 and Mute actions: the raw
+/// message text, when Carrier saw it, and the account it arrived for. Native
+/// memory only: Facebook clears unknown page storage on reload, and a redacted
+/// notification never keeps one.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct ActionTarget {
+    pub(crate) body: String,
+    pub(crate) at: u64,
+    pub(crate) account: String,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+static ACTION_TARGETS: Mutex<VecDeque<(u64, ActionTarget)>> = Mutex::new(VecDeque::new());
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub(crate) fn remember_action_target(native_id: u64, target: ActionTarget) {
+    let mut targets = ACTION_TARGETS.lock().unwrap();
+    targets.retain(|(id, _)| *id != native_id);
+    if targets.len() >= MAX_RECENT_NOTIFICATIONS {
+        targets.pop_front();
+    }
+    targets.push_back((native_id, target));
+}
+
+/// The quick actions a shown notification offers: none for a non-English
+/// Messenger UI or without a recorded target, and Mute alone when there is no
+/// message text for 👍 to match (a photo or a sticker).
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub(crate) fn offered_actions(native_id: u64) -> &'static [NotificationAction] {
+    if !quick_actions_supported() {
+        return &[];
+    }
+    match action_target(native_id) {
+        Some(target) if !target.body.trim().is_empty() => {
+            &[NotificationAction::Like, NotificationAction::Mute]
+        }
+        Some(_) => &[NotificationAction::Mute],
+        None => &[],
+    }
+}
+
+/// Drop the target of a notification that was closed, cleared, or acted on,
+/// so retired entries never push out targets still live in the OS.
+pub(crate) fn forget_action_target(native_id: u64) {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    ACTION_TARGETS
+        .lock()
+        .unwrap()
+        .retain(|(id, _)| *id != native_id);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let _ = native_id;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn action_target(native_id: u64) -> Option<ActionTarget> {
+    ACTION_TARGETS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(id, _)| *id == native_id)
+        .map(|(_, target)| target.clone())
+}
+
+/// The Messenger UI language the page last reported. Like and Mute drive
+/// English-labelled controls, so they are offered only for an English UI;
+/// Reply works in any language.
+static MESSENGER_ENGLISH_UI: AtomicBool = AtomicBool::new(false);
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn quick_actions_supported() -> bool {
+    MESSENGER_ENGLISH_UI.load(Ordering::Relaxed)
 }
 
 impl NotifyMsg {
@@ -347,6 +431,7 @@ fn remember_notification_route(id: u64, value: &str) {
 }
 
 fn take_notification_route(id: u64) -> Option<String> {
+    forget_action_target(id);
     NOTIFICATION_ROUTES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -585,11 +670,10 @@ fn forget_persisted_notification_route(app: &tauri::AppHandle, id: u64) {
     }
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn take_notification_ids_for_thread(
-    app: &tauri::AppHandle,
-    thread_path: &str,
-) -> Vec<u64> {
+/// Retire the in-memory routes and 👍/Mute targets of a conversation's
+/// notifications once the OS has cleared them, returning their ids.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+pub(crate) fn take_routed_notification_ids_for_thread(thread_path: &str) -> Vec<u64> {
     let Some(thread_path) = validated_thread_path(thread_path) else {
         return Vec::new();
     };
@@ -606,6 +690,21 @@ pub(crate) fn take_notification_ids_for_thread(
                 true
             }
         });
+    for id in &ids {
+        forget_action_target(*id);
+    }
+    ids
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn take_notification_ids_for_thread(
+    app: &tauri::AppHandle,
+    thread_path: &str,
+) -> Vec<u64> {
+    let Some(thread_path) = validated_thread_path(thread_path) else {
+        return Vec::new();
+    };
+    let mut ids = take_routed_notification_ids_for_thread(&thread_path);
     if let Some(directory) = persisted_notification_routes_dir(app) {
         match take_persisted_notification_ids_for_thread_from_dir(&directory, &thread_path) {
             Ok(persisted) => ids.extend(persisted),
@@ -616,6 +715,9 @@ pub(crate) fn take_notification_ids_for_thread(
     }
     ids.sort_unstable();
     ids.dedup();
+    for id in &ids {
+        forget_action_target(*id);
+    }
     ids
 }
 
@@ -628,6 +730,7 @@ fn resolved_notification_route(
     // user acted on. Prefer it to every cache so the request remains
     // self-contained across process restarts.
     if let Some(route) = fallback_path.and_then(validated_thread_path) {
+        forget_action_target(id);
         return Some(route);
     }
     let route = take_notification_route(id);
@@ -874,6 +977,19 @@ fn linux_reply_eligible(
         && (snap || (capabilities.actions && capabilities.inline_reply))
 }
 
+/// Like and Mute need the same route and visible preview as a reply, plus a
+/// server that shows actions. The Snap portal path offers only Open and Reply.
+#[cfg(target_os = "linux")]
+fn linux_quick_actions_eligible(
+    hide_preview: bool,
+    notification_id: u64,
+    thread_path: Option<&str>,
+    capabilities: LinuxNotificationCapabilities,
+    snap: bool,
+) -> bool {
+    !hide_preview && notification_id != 0 && thread_path.is_some() && capabilities.actions && !snap
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn macos_reply_eligible(
     hide_preview: bool,
@@ -911,6 +1027,7 @@ enum LinuxSignalDecision {
     Ignore,
     Open,
     Reply(String),
+    Action(NotificationAction),
     Closed,
     AwaitReply,
 }
@@ -927,7 +1044,8 @@ fn classify_linux_signal(
         LinuxNotificationSignal::Action(action) if action == "inline-reply" => {
             LinuxSignalDecision::AwaitReply
         }
-        LinuxNotificationSignal::Action(_) => LinuxSignalDecision::Open,
+        LinuxNotificationSignal::Action(action) => NotificationAction::from_id(&action)
+            .map_or(LinuxSignalDecision::Open, LinuxSignalDecision::Action),
         LinuxNotificationSignal::Reply(text) => LinuxSignalDecision::Reply(text),
         // Some servers close the notification immediately after invoking its
         // reply action. Keep the short reply grace period alive in that case.
@@ -942,6 +1060,7 @@ enum LinuxNotificationResponse {
     Open,
     OpenComposer,
     Reply(String),
+    Action(NotificationAction),
     Closed,
 }
 
@@ -1060,6 +1179,9 @@ async fn wait_for_linux_notification_response(
             LinuxSignalDecision::Reply(text) => {
                 return Ok((LinuxNotificationResponse::Reply(text), activation_token));
             }
+            LinuxSignalDecision::Action(action) => {
+                return Ok((LinuxNotificationResponse::Action(action), activation_token));
+            }
             LinuxSignalDecision::Closed => {
                 return Ok((LinuxNotificationResponse::Closed, activation_token))
             }
@@ -1154,6 +1276,7 @@ fn show_linux_notification<F>(
     image: Option<&Path>,
     sound: bool,
     allow_inline_reply: bool,
+    quick_actions: &[NotificationAction],
     on_response: F,
 ) where
     F: FnOnce((LinuxNotificationResponse, Option<String>)) + Send + 'static,
@@ -1174,6 +1297,9 @@ fn show_linux_notification<F>(
     notification.action("default", "Open");
     if allow_inline_reply {
         notification.action("inline-reply", "Reply");
+    }
+    for action in quick_actions {
+        notification.action(action.id(), action.title());
     }
 
     let result = (|| -> Result<(LinuxNotificationResponse, Option<String>), String> {
@@ -1265,6 +1391,9 @@ const MAX_QUICK_REPLY_CHARS: usize = 2_000;
 const QUICK_REPLY_ACK_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const QUICK_REPLY_DRAFT_TIMEOUT: Duration = Duration::from_secs(45);
+/// Leaves time for a page action's acknowledgement to reach the native waiter.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const PAGE_ACTION_ACK_MARGIN: Duration = Duration::from_secs(2);
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const MAX_PENDING_PAGE_REPLIES: usize = 64;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
@@ -1315,6 +1444,8 @@ static QUICK_REPLY_WORKER_SLOTS: QuickReplyWorkerSlots = QuickReplyWorkerSlots::
 enum PendingReplyMode {
     Send,
     Draft,
+    Mute,
+    Like,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
@@ -1378,6 +1509,18 @@ impl PendingPageReplies {
             .is_some_and(|reply| reply.attempt == attempt)
         {
             self.replies.remove(&id);
+        }
+    }
+
+    /// Move an attempt's resume expiry, e.g. when a reply's acknowledgement
+    /// window restarts after a slow dispatch.
+    fn extend(&mut self, id: u64, attempt: u64, expires_at: Instant) {
+        if let Some(reply) = self
+            .replies
+            .get_mut(&id)
+            .filter(|reply| reply.attempt == attempt)
+        {
+            reply.expires_at = expires_at;
         }
     }
 
@@ -1472,20 +1615,43 @@ fn next_reply_attempt() -> u64 {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+/// `remaining` is what is left of the native acknowledgement wait. Like and
+/// Mute budget from it, so a page reloaded mid-action (and resumed) cannot
+/// finish after the native side has already reported failure.
 fn quick_reply_script(
     id: u64,
     attempt: u64,
     thread_path: &str,
     text: &str,
     mode: PendingReplyMode,
+    remaining: Duration,
 ) -> Result<String, String> {
     let path = serde_json::to_string(thread_path).map_err(|error| error.to_string())?;
-    let text = serde_json::to_string(text).map_err(|error| error.to_string())?;
-    let hook = match mode {
-        PendingReplyMode::Send => "__carrierQuickReply",
-        PendingReplyMode::Draft => "__carrierQuickReplyDraft",
+    // Like and Mute carry a serialized `ActionTarget`. Re-serialize the parsed
+    // object, so only serde's own JSON is ever embedded as an object literal.
+    let target = || {
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text)
+            .and_then(|target| serde_json::to_string(&target))
+            .map_err(|error| format!("notification action target: {error}"))
     };
-    Ok(format!("window.{hook}?.({path}, {text}, {id}, {attempt});"))
+    let text = serde_json::to_string(text).map_err(|error| error.to_string())?;
+    let budget = remaining.saturating_sub(PAGE_ACTION_ACK_MARGIN).as_millis();
+    Ok(match mode {
+        PendingReplyMode::Send => {
+            format!("window.__carrierQuickReply?.({path}, {text}, {id}, {attempt});")
+        }
+        PendingReplyMode::Draft => {
+            format!("window.__carrierQuickReplyDraft?.({path}, {text}, {id}, {attempt});")
+        }
+        PendingReplyMode::Mute => format!(
+            "window.__carrierQuickMute?.({path}, {}, {id}, {attempt}, {budget});",
+            target()?
+        ),
+        PendingReplyMode::Like => format!(
+            "window.__carrierQuickLike?.({path}, {}, {id}, {attempt}, {budget});",
+            target()?
+        ),
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -1495,6 +1661,7 @@ fn register_pending_page_reply(
     thread_path: &str,
     text: &str,
     mode: PendingReplyMode,
+    expires_at: Instant,
 ) {
     pending_page_replies().lock().unwrap().register(
         id,
@@ -1502,12 +1669,7 @@ fn register_pending_page_reply(
         thread_path.to_string(),
         text.to_string(),
         mode,
-        Instant::now()
-            + match mode {
-                PendingReplyMode::Send => QUICK_REPLY_ACK_TIMEOUT,
-                // A fallback can wait behind scheduled delivery before navigation.
-                PendingReplyMode::Draft => QUICK_REPLY_DRAFT_TIMEOUT,
-            },
+        expires_at,
     );
 }
 
@@ -1527,6 +1689,7 @@ pub(crate) fn resume_pending_page_replies(window: &tauri::WebviewWindow) {
             &reply.thread_path,
             &reply.text,
             reply.mode,
+            reply.expires_at.saturating_duration_since(Instant::now()),
         ) {
             Ok(script) => {
                 if let Err(error) = window.eval(script) {
@@ -1547,35 +1710,52 @@ pub(crate) fn resume_pending_page_replies(window: &tauri::WebviewWindow) {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn eval_hidden_quick_reply(
+fn eval_hidden_page_action(
     app: &tauri::AppHandle,
     id: u64,
     attempt: u64,
     thread_path: &str,
     text: &str,
+    mode: PendingReplyMode,
+    deadline: Instant,
 ) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "main window is unavailable".to_string())?;
-    let script = quick_reply_script(id, attempt, thread_path, text, PendingReplyMode::Send)?;
+    let (thread_path, text) = (thread_path.to_string(), text.to_string());
     let (sent, received) = std::sync::mpsc::sync_channel(1);
     app.run_on_main_thread(move || {
-        let result = window.eval(script).map_err(|error| error.to_string());
+        // Budget from when the eval actually runs: a main thread that only
+        // gets here after the deadline must not start the page action.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = if remaining.is_zero() {
+            Err("page action expired before dispatch".to_string())
+        } else {
+            quick_reply_script(id, attempt, &thread_path, &text, mode, remaining)
+                .and_then(|script| window.eval(script).map_err(|error| error.to_string()))
+        };
         let _ = sent.send(result);
     })
     .map_err(|error| error.to_string())?;
     received
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .map_err(|error| format!("quick-reply eval dispatch failed: {error}"))?
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const REPLY_FAILED: &str = "Reply not sent — opening the conversation";
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const MUTE_FAILED: &str = "Couldn't mute. Opening the conversation.";
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const LIKE_FAILED: &str = "Couldn't react. Opening the conversation.";
+
 #[cfg(target_os = "linux")]
-fn show_reply_failure_notification(_app: &tauri::AppHandle) {
+fn show_action_failure_notification(_app: &tauri::AppHandle, body: &str) {
     let mut notification = notify_rust::Notification::new();
     notification
         .appname("Carrier")
         .summary("Carrier")
-        .body("Reply not sent — opening the conversation")
+        .body(body)
         .hint(notify_rust::Hint::SuppressSound(true));
     if let Err(error) = notification.show() {
         log::warn!("failed to show quick-reply failure notification: {error}");
@@ -1583,10 +1763,10 @@ fn show_reply_failure_notification(_app: &tauri::AppHandle) {
 }
 
 #[cfg(target_os = "macos")]
-fn show_reply_failure_notification(_app: &tauri::AppHandle) {
+fn show_action_failure_notification(_app: &tauri::AppHandle, body: &str) {
     deliver_notification_macos(
         "Carrier",
-        "Reply not sent — opening the conversation",
+        body,
         0,
         None,
         false,
@@ -1595,13 +1775,13 @@ fn show_reply_failure_notification(_app: &tauri::AppHandle) {
 }
 
 #[cfg(target_os = "windows")]
-fn show_reply_failure_notification(app: &tauri::AppHandle) {
+fn show_action_failure_notification(app: &tauri::AppHandle, body: &str) {
     // A plain, fixed-string toast (no route, no actions, no grouping).
     crate::windows::toast::deliver_notification_windows(
         app,
         crate::windows::toast::WindowsToastOptions {
             title: "Carrier".into(),
-            body: "Reply not sent — opening the conversation".into(),
+            body: body.into(),
             avatar: None,
             image: None,
             sound: false,
@@ -1623,9 +1803,24 @@ fn open_reply_fallback(
     activation_token: Option<String>,
 ) {
     let attempt = next_reply_attempt();
-    register_pending_page_reply(id, attempt, &thread_path, &text, PendingReplyMode::Draft);
-    let script =
-        quick_reply_script(id, attempt, &thread_path, &text, PendingReplyMode::Draft).unwrap();
+    // A fallback can wait behind scheduled delivery before navigation.
+    register_pending_page_reply(
+        id,
+        attempt,
+        &thread_path,
+        &text,
+        PendingReplyMode::Draft,
+        Instant::now() + QUICK_REPLY_DRAFT_TIMEOUT,
+    );
+    let script = quick_reply_script(
+        id,
+        attempt,
+        &thread_path,
+        &text,
+        PendingReplyMode::Draft,
+        QUICK_REPLY_DRAFT_TIMEOUT,
+    )
+    .unwrap();
     let main_app = app.clone();
     if let Err(error) = app.run_on_main_thread(move || {
         show_main_with_activation_token(&main_app, activation_token.as_deref());
@@ -1635,7 +1830,7 @@ fn open_reply_fallback(
     }) {
         log::warn!("failed to open quick-reply fallback: {error}");
     }
-    show_reply_failure_notification(&app);
+    show_action_failure_notification(&app, REPLY_FAILED);
 }
 
 #[cfg(target_os = "linux")]
@@ -1650,9 +1845,23 @@ fn open_notification_composer(
         return;
     };
     let attempt = next_reply_attempt();
-    register_pending_page_reply(id, attempt, &thread_path, "", PendingReplyMode::Draft);
-    let script =
-        quick_reply_script(id, attempt, &thread_path, "", PendingReplyMode::Draft).unwrap();
+    register_pending_page_reply(
+        id,
+        attempt,
+        &thread_path,
+        "",
+        PendingReplyMode::Draft,
+        Instant::now() + QUICK_REPLY_DRAFT_TIMEOUT,
+    );
+    let script = quick_reply_script(
+        id,
+        attempt,
+        &thread_path,
+        "",
+        PendingReplyMode::Draft,
+        QUICK_REPLY_DRAFT_TIMEOUT,
+    )
+    .unwrap();
     let main_app = app.clone();
     if let Err(error) = app.run_on_main_thread(move || {
         show_main_with_activation_token(&main_app, activation_token.as_deref());
@@ -1676,7 +1885,7 @@ fn deliver_quick_reply(
     let thread_path = resolved_notification_route(&app, id, fallback_path.as_deref());
     let Some(thread_path) = thread_path else {
         log::warn!("quick reply had no validated notification route (id {id})");
-        show_reply_failure_notification(&app);
+        show_action_failure_notification(&app, REPLY_FAILED);
         activate_notification(app, id, page_id, None, activation_token);
         return;
     };
@@ -1692,21 +1901,15 @@ fn deliver_quick_reply(
         return;
     }
 
-    let attempt = next_reply_attempt();
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
-    reply_ack_waiters()
-        .lock()
-        .unwrap()
-        .register(id, attempt, result_tx);
-    register_pending_page_reply(id, attempt, &thread_path, &text, PendingReplyMode::Send);
-    let dispatched = eval_hidden_quick_reply(&app, id, attempt, &thread_path, &text);
-    let sent = dispatched.is_ok()
-        && result_rx
-            .recv_timeout(QUICK_REPLY_ACK_TIMEOUT)
-            .unwrap_or(false);
-    reply_ack_waiters().lock().unwrap().remove(id);
-    pending_page_replies().lock().unwrap().complete(id, attempt);
-    if sent {
+    let deadline = Instant::now() + QUICK_REPLY_ACK_TIMEOUT;
+    if run_hidden_page_action(
+        &app,
+        id,
+        &thread_path,
+        &text,
+        PendingReplyMode::Send,
+        deadline,
+    ) {
         #[cfg(target_os = "macos")]
         if app
             .state::<AppState>()
@@ -1740,12 +1943,182 @@ fn deliver_quick_reply(
             }
         }
     } else {
-        if let Err(error) = dispatched {
-            log::warn!("quick-reply delivery could not start (id {id}): {error}");
-        } else {
-            log::warn!("quick-reply delivery failed or timed out (id {id})");
-        }
         open_reply_fallback(app, id, thread_path, text, activation_token);
+    }
+}
+
+/// Run a notification action in the hidden page and wait for its
+/// acknowledgement. A hard navigation mid-action is resumed by
+/// [`resume_pending_page_replies`].
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn run_hidden_page_action(
+    app: &tauri::AppHandle,
+    id: u64,
+    thread_path: &str,
+    text: &str,
+    mode: PendingReplyMode,
+    deadline: Instant,
+) -> bool {
+    // Keeps a covered or closed macOS window rendering at foreground priority
+    // until this function returns, ahead of any fallback that shows it.
+    #[cfg(target_os = "macos")]
+    let foreground = crate::macos::background_render::begin(app);
+    #[cfg(target_os = "macos")]
+    let started = Instant::now();
+    let attempt = next_reply_attempt();
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    reply_ack_waiters()
+        .lock()
+        .unwrap()
+        .register(id, attempt, result_tx);
+    register_pending_page_reply(id, attempt, thread_path, text, mode, deadline);
+    let dispatched = eval_hidden_page_action(app, id, attempt, thread_path, text, mode, deadline);
+    // A reply's page flow keeps its own fixed budget, so it gets a full
+    // acknowledgement window after a slow dispatch. Like and Mute budget from
+    // `deadline` and must finish inside it.
+    let ack_deadline = if mode == PendingReplyMode::Send {
+        let extended = Instant::now() + QUICK_REPLY_ACK_TIMEOUT;
+        // A hard navigation after a slow dispatch must still resume.
+        pending_page_replies()
+            .lock()
+            .unwrap()
+            .extend(id, attempt, extended);
+        extended
+    } else {
+        deadline
+    };
+    let ok = dispatched.is_ok()
+        && result_rx
+            .recv_timeout(ack_deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(false);
+    reply_ack_waiters().lock().unwrap().remove(id);
+    pending_page_replies().lock().unwrap().complete(id, attempt);
+    match dispatched {
+        Err(error) => log::warn!("notification action could not start (id {id}): {error}"),
+        Ok(()) if !ok => log::warn!("notification action failed or timed out (id {id})"),
+        Ok(()) => {}
+    }
+    #[cfg(target_os = "macos")]
+    log::info!(
+        "notification action finished in {} ms (id {id}, ok {ok}, foreground render {})",
+        started.elapsed().as_millis(),
+        foreground.is_some()
+    );
+    ok
+}
+
+/// Serializes notification actions: each one drives SPA navigation in the same
+/// hidden page, so two conversations must never race each other.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn lock_page_actions() -> std::sync::MutexGuard<'static, ()> {
+    static IN_FLIGHT: Mutex<()> = Mutex::new(());
+    IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The non-reply buttons a message notification carries next to Reply.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NotificationAction {
+    Like,
+    Mute,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+impl NotificationAction {
+    /// The action id shared by macOS categories, Windows toast arguments, and
+    /// Freedesktop actions.
+    pub(crate) const fn id(self) -> &'static str {
+        match self {
+            Self::Like => "like",
+            Self::Mute => "mute",
+        }
+    }
+
+    pub(crate) const fn title(self) -> &'static str {
+        match self {
+            Self::Like => "👍",
+            Self::Mute => "Mute",
+        }
+    }
+
+    pub(crate) fn from_id(id: &str) -> Option<Self> {
+        [Self::Like, Self::Mute]
+            .into_iter()
+            .find(|action| action.id() == id)
+    }
+}
+
+/// Like reacts 👍 to the message the page's notification `page_id` announced
+/// (the page keeps its raw text and time); Mute silences the conversation in
+/// Messenger for 8 hours. Both drive the hidden page in the background, and a
+/// failure opens the conversation instead.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub(crate) fn on_notification_action(
+    app: tauri::AppHandle,
+    id: u64,
+    page_id: Option<u64>,
+    fallback_path: Option<String>,
+    action: NotificationAction,
+    activation_token: Option<String>,
+) {
+    let deadline = Instant::now() + QUICK_REPLY_ACK_TIMEOUT;
+    let (mode, failure) = match action {
+        NotificationAction::Like => (PendingReplyMode::Like, LIKE_FAILED),
+        NotificationAction::Mute => (PendingReplyMode::Mute, MUTE_FAILED),
+    };
+    // What this notification announced: Like matches its text, and both act
+    // only under the account it arrived for.
+    let text = action_target(id)
+        .and_then(|target| serde_json::to_string(&target).ok())
+        .unwrap_or_default();
+    let failed = move |app: tauri::AppHandle, path: Option<String>, token: Option<String>| {
+        show_action_failure_notification(&app, failure);
+        activate_notification(app, id, page_id, path, token);
+    };
+    // Without it (e.g. a notification from before a restart) there is nothing
+    // to identify the target by.
+    if text.is_empty() {
+        log::info!("notification {action:?} has no recorded target (id {id})");
+        failed(app, fallback_path, activation_token);
+        return;
+    }
+    let Some(permit) = QUICK_REPLY_WORKER_SLOTS.try_acquire() else {
+        log::warn!(
+            "notification {action:?} rejected because the native worker cap was reached (id {id})"
+        );
+        failed(app, fallback_path, activation_token);
+        return;
+    };
+    let fallback_app = app.clone();
+    let fallback_path_copy = fallback_path.clone();
+    let fallback_token = activation_token.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("carrier-notification-action".into())
+        .spawn(move || {
+            let _permit = permit;
+            let _guard = lock_page_actions();
+            let Some(thread_path) = resolved_notification_route(&app, id, fallback_path.as_deref())
+            else {
+                log::warn!("notification {action:?} had no validated route (id {id})");
+                failed(app, None, activation_token);
+                return;
+            };
+            // The wait for the page lock counts: an action stuck behind a
+            // stalled one must not land long after the user gave up on it.
+            if Instant::now() >= deadline {
+                log::warn!("notification {action:?} expired while queued (id {id})");
+                failed(app, Some(thread_path), activation_token);
+                return;
+            }
+            if !run_hidden_page_action(&app, id, &thread_path, &text, mode, deadline) {
+                failed(app, Some(thread_path), activation_token);
+            }
+        })
+    {
+        log::warn!("failed to start notification {action:?} worker (id {id}): {error}");
+        failed(fallback_app, fallback_path_copy, fallback_token);
     }
 }
 
@@ -1776,11 +2149,7 @@ pub(crate) fn on_notification_reply(
         .name("carrier-quick-reply".into())
         .spawn(move || {
             let _permit = permit;
-            static REPLY_IN_FLIGHT: OnceLock<Mutex<()>> = OnceLock::new();
-            let _guard = REPLY_IN_FLIGHT
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _guard = lock_page_actions();
             deliver_quick_reply(app, id, page_id, fallback_path, text, activation_token);
         })
     {
@@ -1811,7 +2180,7 @@ fn open_rejected_reply_fallback(
         (Some(path), false) => open_reply_fallback(app, id, path, text, activation_token),
         (Some(path), true) => activate_notification(app, id, page_id, Some(path), activation_token),
         (None, _) => {
-            show_reply_failure_notification(&app);
+            show_action_failure_notification(&app, REPLY_FAILED);
             activate_notification(app, id, page_id, None, activation_token);
         }
     }
@@ -1880,6 +2249,7 @@ pub(crate) fn show_message_notification(
         )
     };
     late_notification_routes().lock().unwrap().forget(msg.id);
+    MESSENGER_ENGLISH_UI.store(msg.english_ui, Ordering::Relaxed);
     if muted {
         log::info!(
             "carrier:notify suppressed by mute_notifications (id {})",
@@ -1936,6 +2306,20 @@ pub(crate) fn show_message_notification(
 
     // Redact the conversation subtitle too: it can contain private names.
     let (title, subtitle, body) = msg.content(hide_preview);
+    // What 👍 and Mute act on. A redacted notification offers neither, so it
+    // never keeps the text.
+    if !hide_preview && !msg.account.is_empty() {
+        remember_action_target(
+            native_id,
+            ActionTarget {
+                body: msg.match_body.clone(),
+                at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_millis() as u64),
+                account: msg.account.clone(),
+            },
+        );
+    }
     // These platforms do not expose a separate subtitle field.
     #[cfg(not(target_os = "macos"))]
     let body = if subtitle.is_empty() {
@@ -1944,17 +2328,34 @@ pub(crate) fn show_message_notification(
         format!("{subtitle}\n{body}")
     };
     #[cfg(target_os = "linux")]
-    let allow_inline_reply = linux_reply_eligible(
-        hide_preview,
-        native_id,
-        thread_path.as_deref(),
-        if crate::install_environment::is_snap() {
+    let (allow_inline_reply, quick_actions) = {
+        let snap = crate::install_environment::is_snap();
+        let capabilities = if snap {
             LinuxNotificationCapabilities::default()
         } else {
             linux_notification_capabilities()
-        },
-        crate::install_environment::is_snap(),
-    );
+        };
+        (
+            linux_reply_eligible(
+                hide_preview,
+                native_id,
+                thread_path.as_deref(),
+                capabilities,
+                snap,
+            ),
+            if linux_quick_actions_eligible(
+                hide_preview,
+                native_id,
+                thread_path.as_deref(),
+                capabilities,
+                snap,
+            ) {
+                offered_actions(native_id)
+            } else {
+                &[]
+            },
+        )
+    };
     // The native id is generated on the trusted side and never reused when the
     // page's callback counter restarts. Old Notification Center entries retain
     // their own in-memory/sidecar route instead of being overwritten here.
@@ -2058,6 +2459,14 @@ pub(crate) fn show_message_notification(
             LinuxNotificationResponse::Reply(text) => {
                 on_notification_reply(app, native_id, Some(page_id), None, text, activation_token)
             }
+            LinuxNotificationResponse::Action(action) => on_notification_action(
+                app,
+                native_id,
+                Some(page_id),
+                None,
+                action,
+                activation_token,
+            ),
             LinuxNotificationResponse::Closed => {
                 let _ = take_notification_route(native_id);
             }
@@ -2068,6 +2477,7 @@ pub(crate) fn show_message_notification(
             image.as_deref(),
             sound,
             allow_inline_reply,
+            quick_actions,
             on_response,
         );
         if let Some(path) = image.as_deref() {
@@ -2230,6 +2640,7 @@ pub(crate) fn show_sync_alert(app: tauri::AppHandle, source: SyncAlertSource, ki
             None,
             false,
             false,
+            &[],
             move |(response, activation_token)| {
                 if matches!(
                     response,
@@ -2317,14 +2728,22 @@ pub(crate) fn show_scheduled_send_warning(app: &tauri::AppHandle) {
     {
         let app = app.clone();
         std::thread::spawn(move || {
-            show_linux_notification(title, body, None, false, false, move |(response, token)| {
-                if matches!(
-                    response,
-                    LinuxNotificationResponse::Open | LinuxNotificationResponse::OpenComposer
-                ) {
-                    activate_notification(app, 0, None, None, token);
-                }
-            })
+            show_linux_notification(
+                title,
+                body,
+                None,
+                false,
+                false,
+                &[],
+                move |(response, token)| {
+                    if matches!(
+                        response,
+                        LinuxNotificationResponse::Open | LinuxNotificationResponse::OpenComposer
+                    ) {
+                        activate_notification(app, 0, None, None, token);
+                    }
+                },
+            )
         });
     }
 }
@@ -2601,6 +3020,9 @@ mod tests {
             image: String::new(),
             dedupe_key: dedupe_key.into(),
             thread_path: String::new(),
+            english_ui: false,
+            match_body: String::new(),
+            account: String::new(),
         }
     }
 
@@ -2718,6 +3140,10 @@ mod tests {
             classify_linux_signal(LinuxNotificationSignal::Action("default".into()), false),
             LinuxSignalDecision::Open
         );
+        assert_eq!(
+            classify_linux_signal(LinuxNotificationSignal::Action("mute".into()), false),
+            LinuxSignalDecision::Action(NotificationAction::Mute)
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2765,6 +3191,31 @@ mod tests {
             async_io::block_on(wait_for_linux_notification_response(messages, 7, ":1.42")).unwrap(),
             (LinuxNotificationResponse::Open, None)
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn page_actions_budget_from_the_remaining_native_wait() {
+        let target = r#"{"body":"hi","at":5,"account":"1"}"#;
+        let script =
+            |mode, remaining| quick_reply_script(7, 3, "/t/1/", target, mode, remaining).unwrap();
+        assert_eq!(
+            script(PendingReplyMode::Mute, Duration::from_secs(20)),
+            // Re-serialized through a map, so keys come out sorted.
+            r#"window.__carrierQuickMute?.("/t/1/", {"account":"1","at":5,"body":"hi"}, 7, 3, 18000);"#
+        );
+        // A resume after most of the wait has passed leaves the page no time.
+        assert!(script(PendingReplyMode::Like, Duration::from_secs(1)).ends_with(", 3, 0);"));
+        // The target is embedded as code, so only a JSON object is accepted.
+        assert!(quick_reply_script(
+            7,
+            3,
+            "/t/1/",
+            "alert(1)",
+            PendingReplyMode::Like,
+            Duration::from_secs(20)
+        )
+        .is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -2859,6 +3310,32 @@ mod tests {
     }
 
     #[test]
+    fn pending_page_replies_extend_only_the_current_attempt() {
+        let now = Instant::now();
+        let mut pending = PendingPageReplies::default();
+        pending.register(
+            7,
+            70,
+            "/t/123/".into(),
+            "reply".into(),
+            PendingReplyMode::Send,
+            now,
+        );
+        pending.extend(7, 69, now + Duration::from_secs(20));
+        assert!(pending.resumable(now).is_empty());
+        pending.register(
+            7,
+            71,
+            "/t/123/".into(),
+            "reply".into(),
+            PendingReplyMode::Send,
+            now,
+        );
+        pending.extend(7, 71, now + Duration::from_secs(20));
+        assert_eq!(pending.resumable(now).len(), 1);
+    }
+
+    #[test]
     fn reply_text_trimming_never_silently_truncates() {
         let text = "å".repeat(MAX_QUICK_REPLY_CHARS + 1);
         let preserved = trimmed_reply_text(&format!("  {text}  "));
@@ -2914,6 +3391,43 @@ mod tests {
         remember_notification_route(9_002, "/t/222/");
         assert_eq!(take_notification_route(9_001).as_deref(), Some("/t/111/"));
         assert_eq!(take_notification_route(9_002).as_deref(), Some("/t/222/"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn retiring_a_route_drops_its_action_target() {
+        // A closed or acted-on notification must not keep a target that
+        // counts against the cap of those still shown.
+        let target = ActionTarget {
+            body: "hi".into(),
+            at: 1,
+            account: "1".into(),
+        };
+        remember_notification_route(9_031, "/t/111/");
+        remember_action_target(9_031, target.clone());
+        remember_action_target(9_032, target.clone());
+        take_notification_route(9_031);
+        assert_eq!(action_target(9_031), None);
+        assert_eq!(action_target(9_032), Some(target));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn clearing_a_thread_drops_its_action_targets() {
+        // Windows removes a conversation's whole toast group on view.
+        let target = ActionTarget {
+            body: "hi".into(),
+            at: 1,
+            account: "1".into(),
+        };
+        remember_notification_route(9_041, "/t/411/");
+        remember_notification_route(9_042, "/t/422/");
+        remember_action_target(9_041, target.clone());
+        remember_action_target(9_042, target.clone());
+        assert_eq!(take_routed_notification_ids_for_thread("/t/411/"), [9_041]);
+        assert_eq!(action_target(9_041), None);
+        assert_eq!(action_target(9_042), Some(target));
+        assert_eq!(take_notification_route(9_042).as_deref(), Some("/t/422/"));
     }
 
     #[test]

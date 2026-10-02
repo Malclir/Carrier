@@ -9,9 +9,16 @@ use objc2::runtime::NSObjectProtocol;
 use objc2_user_notifications::UNUserNotificationCenterDelegate;
 
 use crate::actions::validated_thread_path;
-use crate::notifications::{on_notification_click_with_path, on_notification_reply};
+use crate::notifications::{
+    on_notification_action, on_notification_click_with_path, on_notification_reply,
+    NotificationAction,
+};
 
 const MESSAGE_CATEGORY_ID: &str = "carrier.message";
+/// Reply alone, for a Messenger UI whose language Like/Mute can't drive.
+const REPLY_CATEGORY_ID: &str = "carrier.message.reply";
+/// Reply and Mute, for a notification with no text for 👍 to match.
+const MUTE_CATEGORY_ID: &str = "carrier.message.mute";
 const REPLY_ACTION_ID: &str = "reply";
 const ROUTE_PAIRING_DELAY_SECONDS: f64 = 4.0;
 
@@ -90,6 +97,15 @@ objc2::define_class!(
                 .map(|value| value.to_string())
                 .and_then(|value| validated_thread_path(&value));
             let action = response.actionIdentifier();
+
+            if let Some(action) = NotificationAction::from_id(&action.to_string()) {
+                // Like and Mute run in the background; never block this callback.
+                completion_handler.call(());
+                if let Some(id) = id {
+                    on_notification_action(self.ivars().app.clone(), id, page_id, path, action, None);
+                }
+                return;
+            }
 
             if action.to_string() == REPLY_ACTION_ID {
                 let text = response
@@ -180,7 +196,8 @@ pub(crate) fn setup_macos_notifications(app: &tauri::AppHandle) {
     std::mem::forget(delegate);
 
     // Categories are valid independently of authorization state and must be
-    // registered before a reply-eligible notification is delivered.
+    // registered before a reply-eligible notification is delivered. With more
+    // than one action, macOS folds them into the banner's Options menu.
     let reply = UNTextInputNotificationAction::actionWithIdentifier_title_options_textInputButtonTitle_textInputPlaceholder(
         &NSString::from_str(REPLY_ACTION_ID),
         &NSString::from_str("Reply"),
@@ -189,15 +206,30 @@ pub(crate) fn setup_macos_notifications(app: &tauri::AppHandle) {
         &NSString::from_str("Message…"),
     );
     let reply_action: &UNNotificationAction = &reply;
-    let actions = NSArray::from_slice(&[reply_action]);
+    let [like, mute] = [NotificationAction::Like, NotificationAction::Mute].map(|action| {
+        UNNotificationAction::actionWithIdentifier_title_options(
+            &NSString::from_str(action.id()),
+            &NSString::from_str(action.title()),
+            UNNotificationActionOptionNone,
+        )
+    });
     let intents = NSArray::<NSString>::from_slice(&[]);
-    let category = UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
-        &NSString::from_str(MESSAGE_CATEGORY_ID),
-        &actions,
-        &intents,
-        UNNotificationCategoryOptionNone,
-    );
-    center.setNotificationCategories(&NSSet::from_slice(&[&*category]));
+    let category = |id: &str, actions: &[&UNNotificationAction]| {
+        UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
+            &NSString::from_str(id),
+            &NSArray::from_slice(actions),
+            &intents,
+            UNNotificationCategoryOptionNone,
+        )
+    };
+    let full = category(MESSAGE_CATEGORY_ID, &[reply_action, &*like, &*mute]);
+    let reply_and_mute = category(MUTE_CATEGORY_ID, &[reply_action, &*mute]);
+    let reply_only = category(REPLY_CATEGORY_ID, &[reply_action]);
+    center.setNotificationCategories(&NSSet::from_slice(&[
+        &*full,
+        &*reply_and_mute,
+        &*reply_only,
+    ]));
 
     let options = UNAuthorizationOptions::Badge
         | UNAuthorizationOptions::Alert
@@ -267,6 +299,7 @@ fn apply_route_metadata(
     group_by_conversation: bool,
     reply_eligible: bool,
 ) -> Option<String> {
+    use crate::notifications::{offered_actions, NotificationAction};
     use objc2::rc::Retained;
     use objc2_foundation::{NSDictionary, NSNumber, NSObject, NSString};
 
@@ -281,7 +314,11 @@ fn apply_route_metadata(
         }
     }
     if reply_eligible && thread_path.is_some() {
-        content.setCategoryIdentifier(&NSString::from_str(MESSAGE_CATEGORY_ID));
+        content.setCategoryIdentifier(&NSString::from_str(match offered_actions(id) {
+            [] => REPLY_CATEGORY_ID,
+            [NotificationAction::Mute] => MUTE_CATEGORY_ID,
+            _ => MESSAGE_CATEGORY_ID,
+        }));
     }
 
     let id_key = NSString::from_str("id");

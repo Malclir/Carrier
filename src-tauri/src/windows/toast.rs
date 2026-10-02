@@ -17,6 +17,7 @@
 //! derivation, keep-alive eviction) are unit-tested on any OS; the WinRT glue is
 //! `cfg(target_os = "windows")`.
 
+use crate::notifications::NotificationAction;
 #[cfg(target_os = "windows")]
 use std::collections::VecDeque;
 #[cfg(target_os = "windows")]
@@ -32,8 +33,8 @@ use ::windows::Data::Xml::Dom::XmlDocument;
 use ::windows::Foundation::TypedEventHandler;
 #[cfg(target_os = "windows")]
 use ::windows::UI::Notifications::{
-    NotificationSetting, ToastActivatedEventArgs, ToastDismissedEventArgs, ToastFailedEventArgs,
-    ToastNotification, ToastNotificationManager, ToastNotifier,
+    NotificationSetting, ToastActivatedEventArgs, ToastDismissalReason, ToastDismissedEventArgs,
+    ToastFailedEventArgs, ToastNotification, ToastNotificationManager, ToastNotifier,
 };
 #[cfg(target_os = "windows")]
 use tauri::Manager;
@@ -52,6 +53,9 @@ pub(crate) struct ToastSpec {
     pub sound: bool,
     /// Eligible message toasts gain a reply input plus Reply/Open actions.
     pub reply_eligible: bool,
+    /// The quick actions eligible toasts add beside Reply (see
+    /// `notifications::offered_actions`).
+    pub quick_actions: &'static [NotificationAction],
     /// Sync alerts never get actions or grouping.
     pub is_sync_alert: bool,
 }
@@ -117,8 +121,20 @@ pub(crate) fn build_toast_xml(spec: &ToastSpec) -> String {
             "<actions><input id=\"reply\" type=\"text\" placeHolderContent=\"Message…\"/>",
         );
         xml.push_str(&format!(
-            "<action content=\"Reply\" arguments=\"action=reply&amp;id={id}\" hint-inputId=\"reply\" activationType=\"background\"/><action content=\"Open\" arguments=\"action=open&amp;id={id}\" activationType=\"foreground\"/>",
+            "<action content=\"Reply\" arguments=\"action=reply&amp;id={id}\" hint-inputId=\"reply\" activationType=\"background\"/>",
             id = spec.hex_id,
+        ));
+        for action in spec.quick_actions {
+            xml.push_str(&format!(
+                "<action content=\"{}\" arguments=\"action={}&amp;id={}\" activationType=\"background\"/>",
+                action.title(),
+                action.id(),
+                spec.hex_id,
+            ));
+        }
+        xml.push_str(&format!(
+            "<action content=\"Open\" arguments=\"action=open&amp;id={}\" activationType=\"foreground\"/>",
+            spec.hex_id,
         ));
         xml.push_str("</actions>");
     }
@@ -138,6 +154,7 @@ pub(crate) fn build_toast_xml(spec: &ToastSpec) -> String {
 pub(crate) enum ToastActivation {
     Open,
     Reply,
+    Action(NotificationAction),
 }
 
 /// Parse the `action=<verb>&id=<hex>` launch/argument string WinRT hands the
@@ -149,7 +166,7 @@ pub(crate) fn parse_activation_args(args: &str) -> Option<ToastActivation> {
     match action {
         "open" => Some(ToastActivation::Open),
         "reply" => Some(ToastActivation::Reply),
-        _ => None,
+        other => NotificationAction::from_id(other).map(ToastActivation::Action),
     }
 }
 
@@ -307,6 +324,7 @@ fn show_toast(app: &tauri::AppHandle, opts: &WindowsToastOptions) -> WinResult<(
         hex_id: hex.clone(),
         sound: opts.sound,
         reply_eligible: opts.reply_eligible,
+        quick_actions: crate::notifications::offered_actions(opts.native_id),
         is_sync_alert: opts.is_sync_alert,
     };
 
@@ -343,8 +361,14 @@ fn show_toast(app: &tauri::AppHandle, opts: &WindowsToastOptions) -> WinResult<(
 
     let hex_dismissed = hex.clone();
     toast.Dismissed(&TypedEventHandler::new(
-        move |_sender: Ref<'_, ToastNotification>, _args: Ref<'_, ToastDismissedEventArgs>| {
+        move |_sender: Ref<'_, ToastNotification>, args: Ref<'_, ToastDismissedEventArgs>| {
             forget_keep_alive(&hex_dismissed);
+            // A timed-out banner moves to Action Center, where its actions stay
+            // live; a cancelled or hidden one leaves history.
+            let reason = args.ok().ok().and_then(|args| args.Reason().ok());
+            if reason.is_some_and(|reason| reason != ToastDismissalReason::TimedOut) {
+                crate::notifications::forget_action_target(native_id);
+            }
             Ok(())
         },
     ))?;
@@ -352,6 +376,7 @@ fn show_toast(app: &tauri::AppHandle, opts: &WindowsToastOptions) -> WinResult<(
     toast.Failed(&TypedEventHandler::new(
         move |_sender: Ref<'_, ToastNotification>, _args: Ref<'_, ToastFailedEventArgs>| {
             forget_keep_alive(&hex_failed);
+            crate::notifications::forget_action_target(native_id);
             Ok(())
         },
     ))?;
@@ -411,6 +436,18 @@ fn handle_activation(
         .as_ref()
         .and_then(|activation| activation.Arguments().ok())
         .and_then(|arguments| parse_activation_args(&arguments.to_string()));
+
+    if let Some(ToastActivation::Action(action)) = verb {
+        crate::notifications::on_notification_action(
+            app.clone(),
+            native_id,
+            page_id,
+            route.clone(),
+            action,
+            None,
+        );
+        return;
+    }
 
     if verb == Some(ToastActivation::Reply) {
         let text = activation
@@ -481,6 +518,7 @@ pub(crate) fn clear_thread_group(app: &tauri::AppHandle, thread_id: &str) {
         Err(error) => log::warn!("failed to reach toast history: {error}"),
     }
     forget_keep_alive_group(thread_id);
+    crate::notifications::take_routed_notification_ids_for_thread(&format!("/t/{thread_id}/"));
 }
 
 /// Register Carrier's dedicated toast AppUserModelID in
@@ -610,6 +648,7 @@ mod tests {
             hex_id: hex_id(0x2a),
             sound: true,
             reply_eligible,
+            quick_actions: &[NotificationAction::Like, NotificationAction::Mute],
             is_sync_alert,
         }
     }
@@ -646,6 +685,20 @@ mod tests {
         assert!(xml.contains("action=reply&amp;id=000000000000002a"));
         assert!(xml.contains("hint-inputId=\"reply\" activationType=\"background\""));
         assert!(xml.contains("content=\"Open\""));
+        assert!(xml.contains("arguments=\"action=like&amp;id=000000000000002a\""));
+        assert!(xml.contains("arguments=\"action=mute&amp;id=000000000000002a\""));
+
+        let mut reply_only = spec(true, false);
+        reply_only.quick_actions = &[];
+        let xml = build_toast_xml(&reply_only);
+        assert!(xml.contains("action=reply&amp;id="));
+        assert!(!xml.contains("action=like") && !xml.contains("action=mute"));
+
+        // A photo or sticker has no text for 👍 to match.
+        let mut mute_only = spec(true, false);
+        mute_only.quick_actions = &[NotificationAction::Mute];
+        let xml = build_toast_xml(&mute_only);
+        assert!(!xml.contains("action=like") && xml.contains("action=mute"));
     }
 
     #[test]
@@ -686,6 +739,10 @@ mod tests {
         assert_eq!(
             parse_activation_args("action=reply&id=abc"),
             Some(ToastActivation::Reply)
+        );
+        assert_eq!(
+            parse_activation_args("action=mute&id=abc"),
+            Some(ToastActivation::Action(NotificationAction::Mute))
         );
         assert_eq!(parse_activation_args("action=frob&id=abc"), None);
         assert_eq!(parse_activation_args("id=abc"), None);

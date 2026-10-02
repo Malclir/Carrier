@@ -7,6 +7,7 @@ import {
   conversationTextParts,
   hasCandidateTextChild,
   isUnreadConversationText,
+  rowPreviewMatchText,
 } from "../lib/conversation-row";
 import { EMOJI_SOURCE_RE } from "../lib/emoji";
 import {
@@ -40,7 +41,11 @@ import {
   UnreadArrivalTracker,
   waitForPageNotificationMatch,
 } from "../lib/notification-fallback";
-import { notificationPhotoText, notificationThumbnail } from "../lib/notification-images";
+import {
+  isPhotoOnlyPreview,
+  notificationPhotoText,
+  notificationThumbnail,
+} from "../lib/notification-images";
 import {
   notificationLinkBody,
   notificationLinkCards,
@@ -52,7 +57,7 @@ import {
   readConversationNotificationNames,
 } from "../lib/notification-names";
 import { avatarPhotoId, SenderAvatarStore } from "../lib/sender-avatars";
-import { accountScopedStorageKey, threadIdFromHref, threadPathId } from "../lib/threads";
+import { accountId, accountScopedStorageKey, threadIdFromHref, threadPathId } from "../lib/threads";
 import { unreadCountFromTitle } from "../lib/unread";
 import { chatRows } from "./conversation-actions";
 
@@ -245,6 +250,8 @@ export function initNotificationBridge() {
     onDelivery?: (delivery: NativeNotificationDelivery) => void,
     subtitle = "",
     image = "",
+    // The message's raw text, before link or photo rewording: what 👍 matches.
+    matchBody = "",
   ) => {
     notifyHandlers.set(id, onClick);
     if (notifyHandlers.size > 50) notifyHandlers.delete(notifyHandlers.keys().next().value!);
@@ -265,6 +272,10 @@ export function initNotificationBridge() {
         image,
         dedupe_key: dedupeKey,
         thread_path: threadPath || "",
+        // Like/Mute match English control labels; native offers them only then.
+        english_ui: /^en\b/i.test(document.documentElement.lang),
+        match_body: matchBody,
+        account: accountId(document.cookie) || "",
       },
     })?.catch?.(() => {
       deliveryHandlers.delete(id);
@@ -636,6 +647,10 @@ export function initNotificationBridge() {
             : undefined,
           "",
           hidePreview ? "" : image,
+          // A photo-only summary ("Sent a photo", or "Kim: Sent a photo" in a
+          // group) has no text for 👍 to match, whether or not its thumbnail
+          // loaded.
+          hidePreview || isPhotoOnlyPreview(text.body) ? "" : originalBody,
         );
         // The banner is queued — only now is it safe to persist "delivered"
         // for the pairings this signal absorbed, whether the row matched
@@ -1127,6 +1142,10 @@ export function initNotificationBridge() {
       fallback.dedupeKey,
       () => window.__carrierOpenThread?.(fallback.threadPath),
       fallback.threadPath,
+      undefined,
+      "",
+      "",
+      hidePreview ? "" : rowPreviewMatchText(fallback.body),
     );
   };
 
@@ -1314,6 +1333,7 @@ export function initNotificationBridge() {
         undefined,
         hidePreview ? "" : visiblePresentation.subtitle,
         hidePreview ? "" : image,
+        hidePreview || isPhotoOnlyPreview(text.body) ? "" : rowPreviewMatchText(conversation.body),
       );
     }, FALLBACK_DELAY_MS);
     retainPendingFallback({

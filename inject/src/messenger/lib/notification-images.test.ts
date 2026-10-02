@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { notificationPhotoText, notificationThumbnailSize } from "./notification-images";
+import {
+  isPhotoOnlyPreview,
+  isPhotoSummary,
+  notificationPhotoText,
+  notificationThumbnailSize,
+} from "./notification-images";
 
 test("photo notifications introduce the thumbnail with the sender and a colon", () => {
   for (const body of [
@@ -18,6 +23,14 @@ test("photo notifications introduce the thumbnail with the sender and a colon", 
     title: "Person",
     body: "Sent a photo",
   });
+  // Without a thumbnail the summary stays visible, but is still not matchable text.
+  expect(isPhotoSummary("Sent a photo")).toBe(true);
+  expect(isPhotoSummary("Look at this view!")).toBe(false);
+  // A group preview's sender prefix does not make a photo matchable.
+  expect(isPhotoOnlyPreview("Kim: Sent a photo")).toBe(true);
+  expect(isPhotoOnlyPreview("Captain: Jr: Sendte et bilde.")).toBe(true);
+  expect(isPhotoOnlyPreview("Kim: Look at this view!")).toBe(false);
+  expect(isPhotoOnlyPreview("Look at this view!")).toBe(false);
   for (const body of [
     "Sent a YouTube link: Video",
     "Sent a Spotify link: Song",
