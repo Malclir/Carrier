@@ -23,7 +23,6 @@ import {
   mutedUnreadStorageKey,
   reconcileUnreadConversationCount,
   reconcileUnreadMessageCount,
-  UnreadListReadiness,
   unreadCountFromTitle,
 } from "../lib/unread";
 import { chatRows } from "./conversation-actions";
@@ -40,7 +39,6 @@ export function initUnreadBadge() {
     }
   })();
   const accountStorageKey = mutedUnreadStorageKey(document.cookie);
-  const listReadiness = new UnreadListReadiness();
 
   // Unread conversations: Facebook renders a chat's name/preview bold only
   // while it has unread messages. The class names are hashed and unstable, so
@@ -59,7 +57,7 @@ export function initUnreadBadge() {
     const links = chatRows();
     const seen = new Set<string>();
     let count = 0;
-    const rowObservations: (MutedUnreadObservation & { hasTitle: boolean })[] = [];
+    const rowObservations: MutedUnreadObservation[] = [];
     for (const a of links) {
       const id = threadIdFromHref(a.getAttribute("href"));
       if (!id || seen.has(id)) continue;
@@ -75,32 +73,25 @@ export function initUnreadBadge() {
           break;
         }
       }
-      const candidates = spans.map((span) => {
-        const rect = span.getBoundingClientRect();
-        return {
-          node: span,
-          text: conversationNodeText(span),
-          x: rect.x,
-          y: rect.y,
-          width: rect.width,
-          height: rect.height,
-          ariaHidden: span.getAttribute("aria-hidden") === "true",
-          inAbbreviation: !!span.closest("abbr"),
-          hasTextChild: hasCandidateTextChild(span),
-        };
-      });
-      const hydrated = conversationTextParts(candidates).body.length > 0;
-      const hasTitle = candidates.some(
-        (candidate) =>
-          !candidate.ariaHidden &&
-          !candidate.inAbbreviation &&
-          !candidate.hasTextChild &&
-          candidate.width > 1 &&
-          candidate.height > 1 &&
-          candidate.text.trim().length > 0,
-      );
+      const hydrated =
+        conversationTextParts(
+          spans.map((span) => {
+            const rect = span.getBoundingClientRect();
+            return {
+              node: span,
+              text: conversationNodeText(span),
+              x: rect.x,
+              y: rect.y,
+              width: rect.width,
+              height: rect.height,
+              ariaHidden: span.getAttribute("aria-hidden") === "true",
+              inAbbreviation: !!span.closest("abbr"),
+              hasTextChild: hasCandidateTextChild(span),
+            };
+          }),
+        ).body.length > 0;
       const muted = observeConversationMute(id, row);
-      rowObservations.push({ id, unread, muted, hydrated, hasTitle });
+      rowObservations.push({ id, unread, muted, hydrated });
       if (!unread) continue;
       if (ignoreMuted && muted) continue;
       count++;
@@ -118,17 +109,17 @@ export function initUnreadBadge() {
     }
     const listHydrated =
       rowObservations.length > 0 && rowObservations.every(({ hydrated }) => hydrated === true);
-    const ready = listReadiness.observe(rowObservations);
     return {
       count,
-      // Settled title-only rows can drive the badge, but keep the stricter
-      // preview requirement before retiring persisted muted-unread evidence.
+      // A partly hydrated list proves nothing about any row's read styling.
+      // Keep every persisted identity until the complete rendered list has
+      // preview text, then require stable observations in MutedUnreadStore.
       muteObservations: rowObservations.map((observation) => ({
         ...observation,
         hydrated: listHydrated,
       })),
-      ready,
-      trustworthy: ready && !scrolledFromTop,
+      ready: links.length > 0 && listHydrated,
+      trustworthy: links.length > 0 && listHydrated && !scrolledFromTop,
     };
   };
 
