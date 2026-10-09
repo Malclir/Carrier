@@ -2665,9 +2665,10 @@ ${button.innerHTML}`)
     return null;
   }
   var BulkMediaQueue = class {
-    constructor(adapter, chatKey) {
+    constructor(adapter, chatKey, destinationKey = "downloads") {
       __publicField(this, "adapter", adapter);
       __publicField(this, "chatKey", chatKey);
+      __publicField(this, "destinationKey", destinationKey);
       __publicField(this, "snapshot", {
         status: "idle",
         direction: "older",
@@ -2764,8 +2765,16 @@ ${button.innerHTML}`)
     }
     async run(generation) {
       const visited = /* @__PURE__ */ new Set();
-      const completed = completedMediaByChat.get(this.chatKey) || /* @__PURE__ */ new Set();
-      completedMediaByChat.set(this.chatKey, completed);
+      let destinations = completedMediaByChat.get(this.chatKey);
+      if (!destinations) {
+        destinations = /* @__PURE__ */ new Map();
+        completedMediaByChat.set(this.chatKey, destinations);
+      }
+      let completed = destinations.get(this.destinationKey);
+      if (!completed) {
+        completed = /* @__PURE__ */ new Set();
+        destinations.set(this.destinationKey, completed);
+      }
       try {
         while (generation === this.generation) {
           if (!await this.waitWhilePaused(generation)) return;
@@ -2939,6 +2948,567 @@ ${button.innerHTML}`)
       )
     });
   }
+
+  // inject/src/messenger/lib/bulk-media-gallery.ts
+  var MONTHS = new Map([
+    ...[
+      "january",
+      "february",
+      "march",
+      "april",
+      "may",
+      "june",
+      "july",
+      "august",
+      "september",
+      "october",
+      "november",
+      "december"
+    ].map((name, index) => [name, index + 1]),
+    ...[
+      "janvier",
+      "fevrier",
+      "mars",
+      "avril",
+      "mai",
+      "juin",
+      "juillet",
+      "aout",
+      "septembre",
+      "octobre",
+      "novembre",
+      "decembre"
+    ].map((name, index) => [name, index + 1])
+  ]);
+  var DATE_LABEL = /^(?:view (?:photo|video) sent on ([a-z]+) (\d{1,2}), (\d{4}), \d{1,2}:\d{2} ?(?:am|pm)|voir la (?:photo|video) envoyee? le (\d{1,2}) ([a-z]+) (\d{4})(?:(?:[, ]+| a )\d{1,2}:\d{2})?)$/u;
+  var MONTH_HEADING = /^([\p{L}]+)\s+(\d{4})$/u;
+  var HIDDEN3 = '[hidden], [aria-hidden="true"], [inert]';
+  var VIEWER_DIALOG = '[role="dialog"]';
+  var MAX_SCAN_STEPS = 400;
+  var WAIT_MS = 120;
+  var VIEWER_TIMEOUT_MS = 1e4;
+  var completedByScope = /* @__PURE__ */ new Map();
+  function normalized(value) {
+    return value.toLocaleLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "").replace(/\s+/gu, " ").trim();
+  }
+  function parseGalleryMonthHeading(value) {
+    const match = normalized(value).match(MONTH_HEADING);
+    if (!match) return null;
+    const month = MONTHS.get(match[1]);
+    const year = Number(match[2]);
+    return month && year >= 1900 && year <= 2200 ? { year, month } : null;
+  }
+  function parseGalleryTileDate(value) {
+    const match = normalized(value).match(DATE_LABEL);
+    if (!match) return null;
+    const monthName = match[1] || match[5];
+    const day = Number(match[2] || match[4]);
+    const year = Number(match[3] || match[6]);
+    const month = MONTHS.get(monthName);
+    if (!month || year < 1900 || year > 2200 || day < 1 || day > 31) return null;
+    const actual = new Date(Date.UTC(year, month - 1, day));
+    if (actual.getUTCFullYear() !== year || actual.getUTCMonth() !== month - 1 || actual.getUTCDate() !== day)
+      return null;
+    return { year, month, day };
+  }
+  function isGalleryControl(element2) {
+    if (element2.closest(HIDDEN3) || element2.closest("[data-carrier-bulk-media]")) return false;
+    if (element2.getAttribute("role") !== "button" || element2.getAttribute("tabindex") !== "0")
+      return false;
+    const label2 = element2.getAttribute("aria-label") || "";
+    return /^(?:view (?:photo|video) sent on|voir la (?:photo|video) envoy)/u.test(normalized(label2));
+  }
+  function hasSingleHeading(group, span) {
+    const headings = [...group.querySelectorAll("h3 span")].filter(
+      (element2) => parseGalleryMonthHeading(element2.textContent || "")
+    );
+    return headings.length === 1 && headings[0] === span;
+  }
+  function groupForHeading(span) {
+    let group = span.parentElement?.parentElement || null;
+    for (let depth = 0; group && depth < 4; depth += 1, group = group.parentElement) {
+      if (!hasSingleHeading(group, span)) continue;
+      if ([...group.querySelectorAll('[role="button"][tabindex="0"][aria-label]')].some(
+        isGalleryControl
+      ))
+        return group;
+    }
+    return null;
+  }
+  function groupsWithin(root) {
+    const result = [];
+    for (const span of root.querySelectorAll("h3 span")) {
+      const heading = parseGalleryMonthHeading(span.textContent || "");
+      if (!heading) continue;
+      const group = groupForHeading(span);
+      if (group && root.contains(group)) result.push({ element: group, heading });
+    }
+    return result.filter(
+      (group, index) => result.findIndex((other) => other.element === group.element) === index
+    );
+  }
+  function scrollableAncestor(group) {
+    for (let element2 = group; element2; element2 = element2.parentElement) {
+      const style = getComputedStyle(element2);
+      const bounds = element2.getBoundingClientRect();
+      if (/^(?:auto|scroll)$/u.test(style.overflowY) && !element2.closest(HIDDEN3) && style.visibility === "visible" && bounds.width > 0 && bounds.height > 0)
+        return element2;
+    }
+    return null;
+  }
+  function findMediaGallery() {
+    const headings = [...document.querySelectorAll("h3 span")];
+    const candidateScrollers = /* @__PURE__ */ new Set();
+    for (const span of headings) {
+      if (!parseGalleryMonthHeading(span.textContent || "")) continue;
+      const group = groupForHeading(span);
+      if (!group) continue;
+      const scroller2 = scrollableAncestor(group);
+      if (scroller2) candidateScrollers.add(scroller2);
+    }
+    const ranked = [...candidateScrollers].filter((scroller2) => groupsWithin(scroller2).length > 0);
+    ranked.sort((a, b) => groupsWithin(b).length - groupsWithin(a).length);
+    const scroller = ranked[0];
+    return scroller ? { root: scroller, scroller } : null;
+  }
+  function scan(gallery) {
+    const groups = groupsWithin(gallery.root);
+    const items = [];
+    let problem = "";
+    let previousOrder = Number.POSITIVE_INFINITY;
+    for (const group of groups) {
+      const order = group.heading.year * 12 + group.heading.month;
+      if (order > previousOrder) {
+        problem = "Stopped because the shared media gallery is not in a clear newest-to-oldest order.";
+        break;
+      }
+      previousOrder = order;
+      const controls = [
+        ...group.element.querySelectorAll('[role="button"][tabindex="0"][aria-label]')
+      ].filter(isGalleryControl);
+      for (const control of controls) {
+        const date = parseGalleryTileDate(control.getAttribute("aria-label") || "");
+        const alt = control.querySelector("img")?.getAttribute("alt") || "";
+        if (!date || date.year !== group.heading.year || date.month !== group.heading.month) {
+          problem = "Stopped because a gallery tile has a missing or ambiguous date.";
+          continue;
+        }
+        if (!/^(?:image-\d+|video-\d+\.mp4)$/u.test(alt)) {
+          problem = `Stopped because a dated gallery tile has no recognized photo or video thumbnail (${alt || "missing alt"}).`;
+          continue;
+        }
+        items.push({
+          key: `${date.year}-${date.month}-${date.day}:${normalized(control.getAttribute("aria-label") || "")}:${alt}`,
+          year: date.year,
+          month: date.month,
+          day: date.day,
+          control
+        });
+      }
+    }
+    return { items, groups, problem };
+  }
+  function collectGalleryMedia(gallery) {
+    return scan(gallery).items;
+  }
+  function availableGalleryYears(gallery) {
+    return [...new Set(scan(gallery).items.map((item) => item.year))].sort((a, b) => b - a);
+  }
+  var GalleryYearQueue = class {
+    constructor(options) {
+      __publicField(this, "options", options);
+      __publicField(this, "snapshot", {
+        status: "idle",
+        direction: "older",
+        counts: { saved: 0, skipped: 0, failed: 0 },
+        reason: ""
+      });
+      __publicField(this, "listeners", /* @__PURE__ */ new Set());
+      __publicField(this, "generation", 0);
+      __publicField(this, "running", false);
+      __publicField(this, "pauseWaiter", null);
+      __publicField(this, "pauseStartedAt", 0);
+      __publicField(this, "pausedDuration", 0);
+      __publicField(this, "gallery");
+      __publicField(this, "ownedViewer", null);
+      __publicField(this, "ownedSourceKey", "");
+      this.gallery = options.gallery;
+    }
+    get state() {
+      return { ...this.snapshot, counts: { ...this.snapshot.counts } };
+    }
+    subscribe(listener) {
+      this.listeners.add(listener);
+      listener(this.state);
+      return () => this.listeners.delete(listener);
+    }
+    start(year) {
+      if (this.snapshot.status === "paused") {
+        this.resume();
+        return;
+      }
+      if (this.running) return;
+      if (!Number.isInteger(year) || year < 1900 || year > 2200) {
+        this.setStatus("stopped", "Stopped because the selected year is invalid.", this.generation);
+        return;
+      }
+      const generation = ++this.generation;
+      this.running = true;
+      this.snapshot = {
+        status: "running",
+        direction: "older",
+        counts: { saved: 0, skipped: 0, failed: 0 },
+        reason: `Scanning gallery for ${year} media.`
+      };
+      this.emit();
+      void this.run(year, generation);
+    }
+    pause() {
+      if (this.snapshot.status !== "running") return;
+      this.pauseStartedAt = Date.now();
+      this.snapshot = {
+        ...this.snapshot,
+        status: "paused",
+        reason: "Paused. The active media item will finish before scanning resumes."
+      };
+      this.emit();
+    }
+    resume() {
+      if (this.snapshot.status !== "paused") return;
+      this.pausedDuration += Date.now() - this.pauseStartedAt;
+      this.snapshot = { ...this.snapshot, status: "running", reason: "Resuming gallery scan." };
+      this.emit();
+      this.pauseWaiter?.();
+      this.pauseWaiter = null;
+    }
+    reset() {
+      const wasRunning = this.running;
+      this.generation += 1;
+      this.snapshot = {
+        status: wasRunning ? "stopping" : "idle",
+        direction: this.snapshot.direction,
+        counts: { saved: 0, skipped: 0, failed: 0 },
+        reason: wasRunning ? "Reset requested. Waiting for the active native download to finish." : ""
+      };
+      this.pauseWaiter?.();
+      this.pauseWaiter = null;
+      this.emit();
+    }
+    cancel(reason) {
+      this.generation += 1;
+      this.snapshot = { ...this.snapshot, status: this.running ? "stopping" : "stopped", reason };
+      this.pauseWaiter?.();
+      this.pauseWaiter = null;
+      this.emit();
+    }
+    emit() {
+      const state2 = this.state;
+      for (const listener of this.listeners) listener(state2);
+    }
+    setStatus(status, reason, generation) {
+      if (generation !== this.generation) return;
+      this.snapshot = { ...this.snapshot, status, reason };
+      this.emit();
+    }
+    async wait(generation) {
+      if (generation !== this.generation) return false;
+      if (this.snapshot.status !== "paused") return true;
+      await new Promise((resolve) => {
+        this.pauseWaiter = resolve;
+      });
+      return generation === this.generation;
+    }
+    activeTime() {
+      return Date.now() - this.pausedDuration - (this.snapshot.status === "paused" ? Date.now() - this.pauseStartedAt : 0);
+    }
+    currentGallery() {
+      const found = findMediaGallery();
+      if (found) this.gallery = found;
+      return this.gallery.root.isConnected && this.gallery.scroller.isConnected ? this.gallery : null;
+    }
+    currentViewer() {
+      const dialog = [...document.querySelectorAll(VIEWER_DIALOG)].find(
+        isMediaViewerDialog
+      );
+      return dialog || findRolelessMediaViewer();
+    }
+    async waitForViewer(generation) {
+      const deadline = this.activeTime() + VIEWER_TIMEOUT_MS;
+      while (this.activeTime() < deadline) {
+        if (!await this.wait(generation)) throw new Error("Gallery scan was canceled.");
+        if (!this.options.stillInChat())
+          throw new Error("Stopped because the chat changed during gallery navigation.");
+        const viewer = this.currentViewer();
+        if (viewer) {
+          this.ownedViewer = viewer;
+          return viewer;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, WAIT_MS));
+      }
+      throw new Error(
+        "Stopped because the selected gallery item did not open a media viewer within 10 seconds."
+      );
+    }
+    async waitForSource(viewer, generation) {
+      const deadline = this.activeTime() + VIEWER_TIMEOUT_MS;
+      let stableKey = "";
+      let stable = 0;
+      while (this.activeTime() < deadline) {
+        if (!await this.wait(generation)) throw new Error("Gallery scan was canceled.");
+        if (this.ownedViewer !== viewer || !viewer.isConnected || !this.options.stillInChat())
+          throw new Error("Stopped because the chat or media viewer changed.");
+        const item = findBulkMediaSource(viewer);
+        if (item?.key && item.key === stableKey) stable += 1;
+        else {
+          stableKey = item?.key || "";
+          stable = item ? 1 : 0;
+        }
+        if (item && stable >= 2) return item;
+        await new Promise((resolve) => window.setTimeout(resolve, WAIT_MS));
+      }
+      throw new Error(
+        "Stopped because Messenger did not expose a stable full-size media source within 10 seconds."
+      );
+    }
+    async closeOwnedViewer() {
+      const candidate = this.currentViewer();
+      const candidateSource = candidate ? findBulkMediaSource(candidate)?.key || "" : "";
+      const expectedSourceKey = this.ownedSourceKey;
+      let viewer = candidateSource === expectedSourceKey ? candidate : this.ownedViewer;
+      this.ownedViewer = null;
+      if (!viewer?.isConnected || candidate && candidateSource !== expectedSourceKey) {
+        this.ownedSourceKey = "";
+        return !candidate;
+      }
+      const clickClose = (root) => {
+        const close = [
+          ...root.querySelectorAll('button, [role="button"], a[href]')
+        ].find((control) => {
+          if (control.closest(HIDDEN3)) return false;
+          const label2 = normalized(
+            `${control.getAttribute("aria-label") || ""} ${control.getAttribute("title") || ""}`
+          );
+          return /(?:^|\W)(?:close|fermer)(?:$|\W)/u.test(label2);
+        });
+        close?.click();
+        return !!close;
+      };
+      clickClose(viewer);
+      const deadline = Date.now() + 5e3;
+      while (Date.now() < deadline) {
+        const current = this.currentViewer();
+        if (!current) {
+          this.ownedSourceKey = "";
+          return true;
+        }
+        const currentSourceKey = findBulkMediaSource(current)?.key || "";
+        if (currentSourceKey !== expectedSourceKey) {
+          this.ownedSourceKey = "";
+          return false;
+        }
+        if (current !== viewer) {
+          viewer = current;
+          clickClose(viewer);
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, WAIT_MS));
+      }
+      const closed = this.currentViewer() === null;
+      this.ownedSourceKey = "";
+      return closed;
+    }
+    async openAndSave(media, generation) {
+      if (!this.options.stillInChat())
+        throw new Error("Stopped because the chat changed before opening gallery media.");
+      if (this.currentViewer())
+        throw new Error("Stopped because another media viewer is already open.");
+      const fresh = this.currentGallery();
+      const control = fresh && scan(fresh).items.find((item2) => item2.key === media.key)?.control;
+      if (!control?.isConnected)
+        throw new Error("Stopped because a gallery item changed while the gallery was loading.");
+      control.click();
+      const viewer = await this.waitForViewer(generation);
+      const item = await this.waitForSource(viewer, generation);
+      this.ownedSourceKey = item.key;
+      if (!await this.wait(generation)) return;
+      const current = this.currentViewer();
+      if (!this.options.stillInChat() || !current)
+        throw new Error("Stopped because the chat or media viewer changed before saving.");
+      if (findBulkMediaSource(current)?.key !== item.key)
+        throw new Error("Stopped because the media viewer changed before saving.");
+      if (current !== viewer) this.ownedViewer = current;
+      await this.options.save(item);
+      const scope = `${this.options.chatKey}\0${this.options.destinationKey}`;
+      let completed = completedByScope.get(scope);
+      if (!completed) {
+        completed = /* @__PURE__ */ new Set();
+        completedByScope.set(scope, completed);
+      }
+      completed.add(media.key);
+      if (generation !== this.generation) return;
+      this.snapshot.counts.saved += 1;
+      this.emit();
+    }
+    async run(year, generation) {
+      const scope = `${this.options.chatKey}\0${this.options.destinationKey}`;
+      let completed = completedByScope.get(scope);
+      if (!completed) {
+        completed = /* @__PURE__ */ new Set();
+        completedByScope.set(scope, completed);
+      }
+      const visited = /* @__PURE__ */ new Set();
+      let foundYear = false;
+      let steps = 0;
+      try {
+        if (!this.options.stillInChat())
+          throw new Error("Stopped because the chat changed before gallery scanning started.");
+        if (this.currentViewer())
+          throw new Error(
+            "Stopped because a media viewer is already open; return to shared media and retry."
+          );
+        const initial = this.currentGallery();
+        if (!initial)
+          throw new Error(
+            "Stopped because Messenger's dated shared media gallery could not be found."
+          );
+        initial.scroller.scrollTop = 0;
+        await new Promise((resolve) => window.setTimeout(resolve, WAIT_MS * 2));
+        while (generation === this.generation && steps++ < MAX_SCAN_STEPS) {
+          if (!await this.wait(generation)) return;
+          if (!this.options.stillInChat())
+            throw new Error("Stopped because the chat changed during gallery scanning.");
+          const gallery = this.currentGallery();
+          if (!gallery)
+            throw new Error("Stopped because the shared media gallery disappeared during scanning.");
+          const result = scan(gallery);
+          if (result.problem) throw new Error(result.problem);
+          if (!result.groups.length)
+            throw new Error("Stopped because the gallery no longer exposes dated media groups.");
+          const ordered = result.groups.map((group) => group.heading.year * 12 + group.heading.month);
+          const oldestVisible = Math.min(...ordered);
+          for (const media of result.items) {
+            if (media.year === year) foundYear = true;
+            if (media.year < year) {
+              if (foundYear) {
+                this.setStatus(
+                  "complete",
+                  `Finished ${year}: the gallery reached the next older year.`,
+                  generation
+                );
+                return;
+              }
+              this.setStatus(
+                "complete",
+                `No ${year} media was found in the available gallery.`,
+                generation
+              );
+              return;
+            }
+            if (media.year !== year || visited.has(media.key)) continue;
+            visited.add(media.key);
+            if (completed.has(media.key)) {
+              this.snapshot.counts.skipped += 1;
+              this.emit();
+              continue;
+            }
+            if (!await this.wait(generation)) return;
+            try {
+              await this.openAndSave(media, generation);
+            } catch (error) {
+              const closed = await this.closeOwnedViewer();
+              if (generation !== this.generation) return;
+              if (!closed)
+                throw new Error("Stopped because the opened media viewer did not close cleanly.");
+              if (!this.options.stillInChat()) throw error;
+              const reason = error instanceof Error ? error.message : "Gallery media failed to save.";
+              if (reason.startsWith("Stopped because")) throw error;
+              this.snapshot.counts.failed += 1;
+              this.snapshot.reason = `A gallery item failed and remains retryable. ${reason}`;
+              this.emit();
+            }
+            if (!await this.closeOwnedViewer())
+              throw new Error("Stopped because the opened media viewer did not close cleanly.");
+            if (generation !== this.generation) return;
+            await new Promise((resolve) => window.setTimeout(resolve, WAIT_MS));
+          }
+          if (oldestVisible < year * 12 + 1 && foundYear) {
+            this.setStatus(
+              "complete",
+              `Finished ${year}: the gallery reached the next older year.`,
+              generation
+            );
+            return;
+          }
+          const scroller = gallery.scroller;
+          const oldHeight = scroller.scrollHeight;
+          const oldTop = scroller.scrollTop;
+          scroller.scrollTop = Math.min(
+            oldTop + Math.max(240, Math.floor(scroller.clientHeight * 0.8)),
+            scroller.scrollHeight
+          );
+          const moved = scroller.scrollTop !== oldTop;
+          if (!moved && scroller.scrollHeight === oldHeight) {
+            const before = result.items.map((item) => item.key).join("|");
+            const activeDeadline = this.activeTime() + VIEWER_TIMEOUT_MS;
+            let loaded = false;
+            while (this.activeTime() < activeDeadline) {
+              if (!await this.wait(generation)) return;
+              await new Promise((resolve) => window.setTimeout(resolve, WAIT_MS));
+              if (generation !== this.generation) return;
+              const delayed = this.currentGallery();
+              if (!delayed)
+                throw new Error(
+                  "Stopped because the shared media gallery disappeared during lazy loading."
+                );
+              const after = scan(delayed);
+              if (after.problem) throw new Error(after.problem);
+              if (delayed.scroller.scrollHeight > oldHeight || after.items.map((item) => item.key).join("|") !== before) {
+                loaded = true;
+                break;
+              }
+            }
+            if (!loaded) {
+              this.setStatus(
+                "stopped",
+                foundYear ? `Finished the ${year} media currently available in the gallery, but no older-year boundary could be verified.` : `No ${year} media was found before the available gallery ended; whole-year coverage could not be verified.`,
+                generation
+              );
+              return;
+            }
+          } else {
+            await new Promise((resolve) => window.setTimeout(resolve, WAIT_MS * 3));
+          }
+        }
+        if (steps >= MAX_SCAN_STEPS)
+          throw new Error(
+            "Stopped because gallery scanning reached its safety limit before finding a clear year boundary."
+          );
+      } catch (error) {
+        let closeFailed = false;
+        try {
+          closeFailed = !await this.closeOwnedViewer();
+        } catch {
+          closeFailed = true;
+        }
+        if (generation !== this.generation) return;
+        const reason = error instanceof Error ? error.message : "Gallery scan failed.";
+        this.setStatus(
+          "stopped",
+          closeFailed && !reason.includes("did not close cleanly") ? `${reason} Stopped because the opened media viewer did not close cleanly.` : reason,
+          generation
+        );
+      } finally {
+        try {
+          await this.closeOwnedViewer();
+        } catch {
+        }
+        this.running = false;
+        if (this.snapshot.status === "stopping") {
+          this.snapshot = { ...this.snapshot, status: "idle" };
+          this.emit();
+        }
+      }
+    }
+  };
 
   // inject/src/messenger/lib/download-completion.ts
   var DOWNLOAD_FINISHED_EVENT = "carrier:download-finished";
@@ -3172,7 +3742,7 @@ ${button.innerHTML}`)
   }
   var oversizeByHeader = (res) => Number(res.headers.get("content-length")) > MAX_BLOB;
   var copyAddress = (text) => navigator.clipboard?.writeText(cleanSharedUrl(text)).then(() => toast("Address copied")).catch(() => toast("Copy failed"));
-  async function downloadSrc(src, fallbackName, action2) {
+  async function downloadSrc(src, fallbackName, action2, batchFolder) {
     const res = await fetch(src);
     if (!res.ok) throw new Error(`download failed (${res.status})`);
     if (oversizeByHeader(res)) throw new Error("file too large");
@@ -3192,7 +3762,12 @@ ${button.innerHTML}`)
     document.body.appendChild(a);
     try {
       if (action2) await carrierPrepareDownload(action2, href);
-      if (window.__CARRIER_SETTINGS__?.download_behavior === "ask") {
+      if (batchFolder) {
+        if (typeof carrierPrepareBatchDownload !== "function") {
+          throw new Error("batch folder downloads require a newer Carrier version");
+        }
+        await carrierPrepareBatchDownload(batchFolder, href, name);
+      } else if (window.__CARRIER_SETTINGS__?.download_behavior === "ask") {
         await carrierChooseDownload(href, name);
       }
       const completion = waitForNativeDownload(window, href, carrierVerifyResult);
@@ -3513,55 +4088,92 @@ ${button.innerHTML}`)
   var HOST_ATTR = "data-carrier-bulk-media";
   var VIEWER = '[role="dialog"]';
   var NAVIGATION_TIMEOUT_MS = 1e4;
+  var MIN_YEAR = 2004;
+  var IDLE_SNAPSHOT = {
+    status: "idle",
+    direction: "older",
+    counts: { saved: 0, skipped: 0, failed: 0 },
+    reason: ""
+  };
   function initBulkMedia() {
     let activeDialog = null;
+    let activeGallery = null;
     let host = null;
     let root = null;
     let queue = null;
-    let stopListening = null;
+    let galleryQueue = null;
+    let galleryQueueRoot = null;
+    let stopDirectionListening = null;
+    let stopGalleryListening = null;
     let activeChatKey = "";
+    let queueDialog = null;
+    let queueDestinationKey = "";
+    let mode = "direction";
+    let modeInitialized = false;
+    let direction = "older";
+    let year = (/* @__PURE__ */ new Date()).getFullYear();
+    let yearEdited = false;
+    let renderedGalleryYears = "";
+    let folder = null;
+    let folderLabel = "Downloads";
+    let pickerPending = false;
+    let actionError = "";
     const chatKey = () => location.pathname.match(/\/messages(?:\/e2ee)?\/t\/[^/]+/u)?.[0] || location.pathname;
     const isViewer = (element2) => element2.matches(VIEWER) && isMediaViewerDialog(element2) || isBulkMediaViewer(element2);
     const findViewer = () => {
       const dialog = [...document.querySelectorAll(VIEWER)].find(isMediaViewerDialog);
       return dialog || findRolelessMediaViewer();
     };
-    const refresh = () => {
-      const next = activeDialog?.isConnected && isViewer(activeDialog) ? activeDialog : findViewer();
-      const nextChatKey = chatKey();
-      if (next === activeDialog && activeChatKey === nextChatKey && host) return;
-      queue?.cancel("Stopped because the chat or media viewer changed.");
-      activeDialog = next;
-      stopListening?.();
-      stopListening = null;
-      queue = null;
-      if (!next) {
-        host?.remove();
-        host = null;
-        root = null;
-        activeChatKey = nextChatKey;
-        return;
-      }
+    const folderKey = () => folder || "downloads";
+    const snapshot = () => {
+      if (mode === "year") return galleryQueue?.state || IDLE_SNAPSHOT;
+      return queue?.state || { ...IDLE_SNAPSHOT, direction };
+    };
+    const isLive = (state2) => state2.status === "running" || state2.status === "paused" || state2.status === "stopping";
+    const protectedYearRun = () => !!galleryQueue && isLive(galleryQueue.state);
+    const hasYearResult = () => !!galleryQueue && (galleryQueue.state.status === "stopped" || galleryQueue.state.status === "complete");
+    const ensureHost = () => {
       if (!host) {
         host = document.createElement("div");
         host.setAttribute(HOST_ATTR, "");
         root = host.attachShadow({ mode: "open" });
+        host.setAttribute("data-open", "");
       }
-      host.setAttribute("data-open", "");
       if (!host.isConnected) document.body.appendChild(host);
-      activeChatKey = nextChatKey;
-      const queuedDialog = next;
-      const queuedChatKey = nextChatKey;
+    };
+    const clearQueueBinding = (reason) => {
+      if (reason) {
+        queue?.cancel(reason);
+        galleryQueue?.cancel(reason);
+      }
+      stopDirectionListening?.();
+      stopGalleryListening?.();
+      stopDirectionListening = null;
+      stopGalleryListening = null;
+      queue = null;
+      galleryQueue = null;
+      galleryQueueRoot = null;
+      queueDialog = null;
+      queueDestinationKey = "";
+    };
+    const makeDirectionQueue = (dialog, queuedChatKey) => {
+      const destinationKey = folderKey();
+      if (queue && queueDialog === dialog && activeChatKey === queuedChatKey && queueDestinationKey === destinationKey)
+        return;
+      queue?.cancel("Stopped because the chat or media viewer changed.");
+      stopDirectionListening?.();
+      stopDirectionListening = null;
+      const queuedDialog = dialog;
       const stillInQueue = () => !!queuedDialog.isConnected && activeDialog === queuedDialog && isViewer(queuedDialog) && chatKey() === queuedChatKey;
       queue = new BulkMediaQueue(
         {
           current: () => isViewer(queuedDialog) ? findBulkMediaSource(queuedDialog) : null,
           save: async (item) => {
-            await downloadSrc(item.src, item.fallbackName);
+            await downloadSrc(item.src, item.fallbackName, void 0, folder ?? void 0);
           },
-          advance: async (direction, previousKey) => {
+          advance: async (selectedDirection, previousKey) => {
             if (!stillInQueue()) return false;
-            const button = findMediaNavigation(queuedDialog, direction);
+            const button = findMediaNavigation(queuedDialog, selectedDirection);
             if (!button)
               throw new Error(
                 "Stopped because Messenger exposes no recognized Previous/Next control in this viewer."
@@ -3592,65 +4204,273 @@ ${button.innerHTML}`)
           },
           stillInChat: stillInQueue
         },
-        queuedChatKey
+        queuedChatKey,
+        destinationKey
       );
-      stopListening = queue.subscribe(render);
-      render(queue.state);
+      queueDialog = dialog;
+      queueDestinationKey = destinationKey;
+      stopDirectionListening = queue.subscribe(() => render());
     };
-    function render(state2) {
+    const refresh = () => {
+      const nextDialog = activeDialog?.isConnected && isViewer(activeDialog) ? activeDialog : findViewer();
+      const nextGallery = findMediaGallery();
+      const nextChatKey = chatKey();
+      const previouslyAvailable = !!activeDialog || !!activeGallery;
+      const previousDialog = activeDialog;
+      const previousGalleryRoot = activeGallery?.root || null;
+      const chatChanged = !!activeChatKey && activeChatKey !== nextChatKey;
+      if (chatChanged) {
+        clearQueueBinding("Stopped because the chat or media viewer changed.");
+        yearEdited = false;
+      }
+      if (nextGallery && (!activeGallery || activeGallery.root !== nextGallery.root || chatChanged) && !yearEdited && !protectedYearRun())
+        year = chooseDefaultYear(nextGallery, availableGalleryYears(nextGallery));
+      activeChatKey = nextChatKey;
+      activeDialog = nextDialog;
+      activeGallery = nextGallery;
+      if (!modeInitialized || chatChanged || !previouslyAvailable && (nextDialog || nextGallery)) {
+        mode = nextDialog ? "direction" : nextGallery ? "year" : "direction";
+        modeInitialized = true;
+      }
+      if (!nextDialog && !nextGallery && !protectedYearRun() && !hasYearResult()) {
+        host?.remove();
+        host = null;
+        root = null;
+        return;
+      }
+      ensureHost();
+      if (protectedYearRun()) {
+        render();
+        return;
+      }
+      if (galleryQueue) {
+        if (nextGallery && nextGallery.root !== galleryQueueRoot) {
+          stopGalleryListening?.();
+          stopGalleryListening = null;
+          galleryQueue = null;
+          galleryQueueRoot = null;
+        }
+      }
+      if (!nextGallery && nextDialog && mode === "year" && !hasYearResult()) mode = "direction";
+      if (!nextDialog && nextGallery && mode === "direction") mode = "year";
+      if (!nextDialog && !nextGallery && !galleryQueue) {
+        host?.remove();
+        host = null;
+        root = null;
+        return;
+      }
+      const yearsSignature = nextGallery ? availableGalleryYears(nextGallery).join(",") : "";
+      const contextChanged = chatChanged || previousDialog !== nextDialog || previousGalleryRoot !== (nextGallery?.root || null);
+      if (!contextChanged && yearsSignature === renderedGalleryYears) return;
+      renderedGalleryYears = yearsSignature;
+      if (nextDialog && mode === "direction") makeDirectionQueue(nextDialog, nextChatKey);
+      else if (queue) {
+        queue.cancel("Stopped because the chat or media viewer changed.");
+        stopDirectionListening?.();
+        stopDirectionListening = null;
+        queue = null;
+        queueDialog = null;
+        queueDestinationKey = "";
+      }
+      render();
+    };
+    function render() {
       if (!root) return;
+      const state2 = snapshot();
+      const active = isLive(state2) || pickerPending;
+      const years = activeGallery ? availableGalleryYears(activeGallery) : [];
+      const maxYear = (/* @__PURE__ */ new Date()).getFullYear() + 1;
+      const askWithoutFolder = window.__CARRIER_SETTINGS__?.download_behavior === "ask" && !folder;
+      const nativeMissing = !!folder && typeof carrierPrepareBatchDownload !== "function";
+      const yearBlockedByViewer = mode === "year" && !!activeDialog;
+      const hint = actionError || (mode === "year" ? !activeGallery ? "Open the shared media gallery to choose a year." : yearBlockedByViewer ? "Close the full-size photo or video before starting a whole-year batch." : askWithoutFolder ? "Choose a batch folder or set Carrier Settings to “Downloads folder” and reopen the viewer." : nativeMissing ? "Batch folders require a newer Carrier version. Update and reopen the app." : "Saves dated photo and video originals from the selected year. Messenger may not expose the full history." : askWithoutFolder ? "Choose a batch folder or set Carrier Settings to “Downloads folder” and reopen the viewer." : "Starts from the open photo and follows Previous or Next.");
+      const focusedElement = root.activeElement instanceof HTMLElement ? root.activeElement : null;
+      const focusControl = focusedElement?.dataset.control ? `[data-control="${focusedElement.dataset.control}"]` : focusedElement?.dataset.action ? `[data-action="${focusedElement.dataset.action}"]` : focusedElement?.dataset.direction ? `[data-direction="${focusedElement.dataset.direction}"]` : focusedElement?.classList.contains("open") ? ".open" : "";
+      const focusedValue = focusedElement instanceof HTMLInputElement || focusedElement instanceof HTMLSelectElement ? focusedElement.value : null;
       root.innerHTML = `<style>
       :host{all:initial;position:fixed;z-index:2147483646;left:18px;top:18px;color-scheme:light dark;font:14px/1.4 system-ui,-apple-system,sans-serif}
-      *{box-sizing:border-box}button{font:inherit;color:inherit;cursor:pointer}
-      .wrap{position:relative}.open{border:0;border-radius:999px;padding:10px 16px;background:#1877f2;color:white;box-shadow:0 2px 12px #0005;font-weight:650}
-      .panel{display:none;position:absolute;left:0;top:48px;width:300px;padding:14px;border-radius:12px;background:#fff;color:#1c1e21;box-shadow:0 6px 28px #0005}
-      :host([data-open]) .panel{display:block}h2{font-size:16px;margin:0 0 8px}.directions,.actions{display:flex;gap:8px;margin:10px 0}
-      .directions button,.actions button{border:1px solid #ccd0d5;border-radius:8px;padding:7px 10px;background:#f5f6f7}
-      button[aria-pressed=true]{border-color:#1877f2;background:#e7f3ff;color:#0866ff}.actions .primary{background:#1877f2;color:white;border-color:#1877f2}
-      .counts{margin:8px 0;color:#444}.reason{margin:8px 0 0;color:#555;overflow-wrap:anywhere}.hint{color:#555;font-size:13px;margin:8px 0 0}
-      @media(prefers-color-scheme:dark){.panel{background:#242526;color:#e4e6eb}.directions button,.actions button{background:#3a3b3c;border-color:#555;color:#e4e6eb}.counts,.reason,.hint{color:#c9cdd2}}
+      *{box-sizing:border-box}[hidden]{display:none!important}button,select,input{font:inherit;color:inherit}
+      button{cursor:pointer}.wrap{position:relative}.open{border:0;border-radius:999px;padding:10px 16px;background:#1877f2;color:white;box-shadow:0 2px 12px #0005;font-weight:650}
+      .panel{display:none;position:absolute;left:0;top:48px;width:320px;padding:14px;border-radius:12px;background:#fff;color:#1c1e21;box-shadow:0 6px 28px #0005}
+      :host([data-open]) .panel{display:block}h2{font-size:16px;margin:0 0 10px}.field{display:grid;gap:5px;margin:9px 0}.field label{font-weight:600}.field select,.field input{width:100%;border:1px solid #ccd0d5;border-radius:7px;padding:7px 9px;background:#fff;color:#1c1e21}
+      .folder{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:11px 0}.folder-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.folder button,.directions button,.actions button{border:1px solid #ccd0d5;border-radius:8px;padding:7px 10px;background:#f5f6f7;color:inherit;white-space:nowrap}
+      .directions,.actions{display:flex;gap:7px;margin:10px 0}.actions button{flex:1}.primary{background:#1877f2!important;color:white!important;border-color:#1877f2!important}
+      button[aria-pressed=true]{border-color:#1877f2;background:#e7f3ff;color:#0866ff}.counts{margin:8px 0;color:#444}.reason{margin:8px 0 0;color:#555;overflow-wrap:anywhere}.hint{color:#555;font-size:13px;margin:8px 0 0;overflow-wrap:anywhere}
+      button:disabled,select:disabled,input:disabled{opacity:.5;cursor:default}
+      @media(prefers-color-scheme:dark){.panel{background:#242526;color:#e4e6eb}.field select,.field input{background:#3a3b3c;border-color:#555;color:#e4e6eb}.folder button,.directions button,.actions button{background:#3a3b3c;border-color:#555;color:#e4e6eb}.counts,.reason,.hint{color:#c9cdd2}}
     </style><div class="wrap"><button type="button" class="open" aria-expanded="true">Batch download</button><section class="panel" aria-label="Batch download"><h2>Download chat media</h2>
-      <div class="directions"><button type="button" data-direction="older" aria-pressed="${state2.direction === "older"}">← Previous</button><button type="button" data-direction="newer" aria-pressed="${state2.direction === "newer"}">Next →</button></div>
+      <div class="field"><label for="batch-mode">Download scope</label><select id="batch-mode" data-control="mode"><option value="year" ${mode === "year" ? "selected" : ""}>Whole year</option><option value="direction" ${mode === "direction" ? "selected" : ""}>From open photo</option></select></div>
+      <div class="field year-field" ${mode === "year" ? "" : "hidden"}><label for="batch-year">Year</label><input id="batch-year" data-control="year" type="number" min="${MIN_YEAR}" max="${maxYear}" step="1" value="${year}" list="batch-years"><datalist id="batch-years">${years.map((item) => `<option value="${item}"></option>`).join("")}</datalist></div>
+      <div class="folder"><span>Save to <strong class="folder-name">${escapeHtml(folderLabel)}</strong></span><button type="button" data-action="choose-folder">${folder ? "Change folder" : "Choose folder"}</button></div>
+      <div class="directions" ${mode === "direction" ? "" : "hidden"}><button type="button" data-direction="older" aria-pressed="${direction === "older"}">← Previous</button><button type="button" data-direction="newer" aria-pressed="${direction === "newer"}">Next →</button></div>
       <div class="actions"><button type="button" class="primary" data-action="start">Start</button><button type="button" data-action="pause">Pause</button><button type="button" data-action="resume">Resume</button><button type="button" data-action="reset">Reset</button></div>
       <p class="counts">Saved ${state2.counts.saved} · Skipped ${state2.counts.skipped} · Failed ${state2.counts.failed}</p>
-      <p class="reason">${escapeHtml(state2.reason)}</p>
-      ${window.__CARRIER_SETTINGS__?.download_behavior === "ask" ? '<p class="hint">Bulk downloads need automatic saving. In Carrier Settings, choose “Downloads folder” and reopen this viewer.</p>' : '<p class="hint">Starts from the item open now and follows the selected direction. Photos and videos only.</p>'}
+      <p class="reason">${escapeHtml(state2.reason)}</p><p class="hint">${escapeHtml(hint)}</p>
     </section></div>`;
-      const open = root.querySelector(".open");
-      open.setAttribute("aria-expanded", String(host?.hasAttribute("data-open") || false));
       if (host) {
         host.dataset.status = state2.status;
         host.dataset.saved = String(state2.counts.saved);
         host.dataset.skipped = String(state2.counts.skipped);
         host.dataset.failed = String(state2.counts.failed);
       }
+      if (focusControl) {
+        const replacement = root.querySelector(focusControl);
+        if (replacement && !("disabled" in replacement && replacement.disabled)) {
+          if (focusedValue !== null && (replacement instanceof HTMLInputElement || replacement instanceof HTMLSelectElement))
+            replacement.value = focusedValue;
+          replacement.focus();
+        }
+      }
+      const open = root.querySelector(".open");
+      open.setAttribute("aria-expanded", String(host?.hasAttribute("data-open") || false));
       open.addEventListener("click", () => {
         if (!host) return;
         host.toggleAttribute("data-open");
         open.setAttribute("aria-expanded", String(host.hasAttribute("data-open")));
       });
+      const setBusyDisabled = (element2) => {
+        element2.disabled = active;
+      };
+      const modeSelect = root.querySelector('[data-control="mode"]');
+      setBusyDisabled(modeSelect);
+      modeSelect.querySelector('option[value="year"]').disabled = !activeGallery;
+      modeSelect.querySelector('option[value="direction"]').disabled = !activeDialog;
+      root.querySelector('[data-control="year"]').disabled = active || !activeGallery;
       root.querySelectorAll("[data-direction]").forEach((button) => {
+        button.setAttribute("aria-pressed", String(button.dataset.direction === direction));
+        button.disabled = active || !activeDialog;
         button.addEventListener("click", () => {
-          if (!queue) return;
-          queue.selectDirection(button.dataset.direction);
+          direction = button.dataset.direction;
+          if (queue) queue.selectDirection(direction);
+          render();
         });
       });
-      root.querySelector('[data-action="start"]').addEventListener("click", () => {
-        if (window.__CARRIER_SETTINGS__?.download_behavior === "ask") return;
-        queue?.start(state2.direction);
+      root.querySelector('[data-action="choose-folder"]').disabled = active;
+      root.querySelector('[data-action="choose-folder"]').addEventListener("click", () => {
+        void chooseFolder();
       });
-      root.querySelector('[data-action="pause"]').addEventListener("click", () => queue?.pause());
-      root.querySelector('[data-action="resume"]').addEventListener("click", () => queue?.resume());
-      root.querySelector('[data-action="reset"]').addEventListener("click", () => queue?.reset());
-      root.querySelectorAll('[data-action="start"]').forEach((button) => {
-        if (window.__CARRIER_SETTINGS__?.download_behavior === "ask" || state2.status === "stopping")
-          button.disabled = true;
+      root.querySelector('[data-control="mode"]').addEventListener("change", (event) => {
+        const nextMode = event.currentTarget.value;
+        if (mode === "year" && nextMode !== "year") {
+          stopGalleryListening?.();
+          stopGalleryListening = null;
+          galleryQueue = null;
+          galleryQueueRoot = null;
+        }
+        mode = nextMode;
+        actionError = "";
+        if (mode === "direction" && activeDialog) makeDirectionQueue(activeDialog, activeChatKey);
+        render();
       });
-      root.querySelectorAll("[data-direction]").forEach((button) => {
-        button.disabled = state2.status === "running" || state2.status === "paused" || state2.status === "stopping";
+      root.querySelector('[data-control="year"]').addEventListener("change", (event) => {
+        const value = Number(event.currentTarget.value);
+        if (Number.isInteger(value) && value >= MIN_YEAR && value <= maxYear) {
+          year = value;
+          yearEdited = true;
+        }
+        render();
       });
-      root.querySelector('[data-action="pause"]').disabled = state2.status !== "running";
-      root.querySelector('[data-action="resume"]').disabled = state2.status !== "paused";
+      const startButton = root.querySelector('[data-action="start"]');
+      startButton.disabled = active || askWithoutFolder || mode === "direction" && !activeDialog;
+      startButton.addEventListener("click", () => void startBatch());
+      const pauseButton = root.querySelector('[data-action="pause"]');
+      pauseButton.disabled = state2.status !== "running";
+      pauseButton.addEventListener("click", () => (mode === "year" ? galleryQueue : queue)?.pause());
+      const resumeButton = root.querySelector('[data-action="resume"]');
+      resumeButton.disabled = state2.status !== "paused";
+      resumeButton.addEventListener(
+        "click",
+        () => (mode === "year" ? galleryQueue : queue)?.resume()
+      );
+      const resetButton = root.querySelector('[data-action="reset"]');
+      resetButton.disabled = active && state2.status === "stopping";
+      resetButton.addEventListener("click", () => (mode === "year" ? galleryQueue : queue)?.reset());
+    }
+    async function chooseFolder() {
+      if (pickerPending) return;
+      actionError = "";
+      if (typeof carrierChooseBatchFolder !== "function") {
+        actionError = "Folder selection requires a newer Carrier version. Update and reopen the app.";
+        render();
+        return;
+      }
+      pickerPending = true;
+      const pickerChatKey = activeChatKey;
+      render();
+      try {
+        const selected = await carrierChooseBatchFolder();
+        if (pickerChatKey !== chatKey()) return;
+        folder = selected.folder;
+        folderLabel = selected.label?.replace(/^.*[\\/]/u, "") || "Selected folder";
+        actionError = "";
+        clearQueueBinding();
+      } catch {
+        actionError = "Folder selection was canceled or unavailable.";
+      } finally {
+        pickerPending = false;
+        render();
+      }
+    }
+    async function startBatch() {
+      actionError = "";
+      const destinationKey = folderKey();
+      if (mode === "year") {
+        if (!activeGallery) {
+          actionError = "Open the shared media gallery before starting a year batch.";
+        } else if (findViewer()) {
+          actionError = "Close the full-size photo or video before starting a whole-year batch.";
+        } else if (folder && typeof carrierPrepareBatchDownload !== "function") {
+          actionError = "Year batches require a newer Carrier version. Update and reopen the app.";
+        } else if (window.__CARRIER_SETTINGS__?.download_behavior === "ask" && !folder) {
+          actionError = "Choose a batch folder to save without changing the per-download ask setting.";
+        } else {
+          const gallery = activeGallery;
+          const queuedChatKey = activeChatKey;
+          const selectedFolder = folder;
+          galleryQueue?.cancel("A new year batch was started.");
+          stopGalleryListening?.();
+          stopGalleryListening = null;
+          galleryQueue = new GalleryYearQueue({
+            gallery,
+            chatKey: queuedChatKey,
+            destinationKey,
+            stillInChat: () => chatKey() === queuedChatKey,
+            save: async (item) => {
+              await downloadSrc(item.src, item.fallbackName, void 0, selectedFolder || void 0);
+            }
+          });
+          galleryQueueRoot = gallery.root;
+          stopGalleryListening = galleryQueue.subscribe(() => render());
+          galleryQueue.start(year);
+        }
+      } else if (!activeDialog) {
+        actionError = "Open a full-size photo or video to use Previous or Next.";
+      } else if (window.__CARRIER_SETTINGS__?.download_behavior === "ask" && !folder) {
+        actionError = "Choose a batch folder to save without changing the per-download ask setting.";
+      } else {
+        makeDirectionQueue(activeDialog, activeChatKey);
+        queue?.start(direction);
+      }
+      render();
+    }
+    function chooseDefaultYear(gallery, years) {
+      const visibleCounts = /* @__PURE__ */ new Map();
+      const scroller = gallery.scroller.getBoundingClientRect();
+      const visibleBounds = {
+        left: Math.max(0, scroller.left),
+        top: Math.max(0, scroller.top),
+        right: Math.min(innerWidth, scroller.right),
+        bottom: Math.min(innerHeight, scroller.bottom)
+      };
+      for (const item of collectGalleryMedia(gallery)) {
+        const rect = item.control.getBoundingClientRect();
+        if (item.year >= MIN_YEAR && rect.width > 0 && rect.height > 0 && rect.bottom > visibleBounds.top && rect.top < visibleBounds.bottom && rect.right > visibleBounds.left && rect.left < visibleBounds.right)
+          visibleCounts.set(item.year, (visibleCounts.get(item.year) || 0) + 1);
+      }
+      const visible2 = [...visibleCounts.entries()].sort(
+        (a, b) => b[1] - a[1] || years.indexOf(a[0]) - years.indexOf(b[0])
+      )[0]?.[0];
+      return visible2 ?? years.find((item) => item >= MIN_YEAR) ?? (/* @__PURE__ */ new Date()).getFullYear();
     }
     function escapeHtml(value) {
       return value.replace(
@@ -3668,11 +4488,13 @@ ${button.innerHTML}`)
     };
     const observer = new MutationObserver((records) => {
       const relevant = records.some((record2) => {
-        if (record2.target instanceof Element && (activeDialog?.contains(record2.target) || record2.target.matches("a[download]")))
+        if (record2.target instanceof Element && (activeDialog?.contains(record2.target) || activeGallery?.root.contains(record2.target) || record2.target.matches("a[download]")))
           return true;
-        return record2.type === "childList" && [...record2.addedNodes, ...record2.removedNodes].some(
-          (node) => node instanceof Element && (node.matches(VIEWER) || node.matches("a[download]") || !!node.querySelector(`${VIEWER}, a[download]`) || !!activeDialog && node.contains(activeDialog))
+        if (record2.type !== "childList") return false;
+        const changed = [...record2.addedNodes, ...record2.removedNodes].some(
+          (node) => node instanceof Element && (node.matches(VIEWER) || node.matches("a[download]") || !!node.querySelector(`${VIEWER}, a[download]`) || !!activeDialog && node.contains(activeDialog) || !!activeGallery && node.contains(activeGallery.root))
         );
+        return changed || !activeGallery && !!findMediaGallery();
       });
       if (relevant) schedule();
     });
@@ -3694,11 +4516,11 @@ ${button.innerHTML}`)
     });
     const mediaLoaded = (event) => {
       if (!(event.target instanceof Element)) return;
-      if (activeDialog?.contains(event.target)) {
+      if (activeDialog?.contains(event.target) || activeGallery?.root.contains(event.target)) {
         schedule();
         return;
       }
-      if (!activeDialog && event.target.matches("img, video") && document.querySelector("a[download]"))
+      if (!activeDialog && event.target.matches("img, video") && (document.querySelector("a[download]") || findMediaGallery()))
         schedule();
     };
     document.addEventListener("load", mediaLoaded, true);
@@ -3925,7 +4747,7 @@ ${button.innerHTML}`)
       );
       button.click();
     };
-    const scan = () => {
+    const scan2 = () => {
       scheduled = false;
       if (done) return;
       const button = findOptionalCookieDeclineButton();
@@ -3943,7 +4765,7 @@ ${button.innerHTML}`)
     const schedule = () => {
       if (scheduled || done) return;
       scheduled = true;
-      requestAnimationFrame(scan);
+      requestAnimationFrame(scan2);
     };
     observer = new MutationObserver(schedule);
     observer.observe(document.documentElement, {
@@ -4081,7 +4903,7 @@ ${button.innerHTML}`)
       if (source) sourceDescriptor.set?.call(image, source);
       pending.delete(image);
     };
-    const scan = () => {
+    const scan2 = () => {
       scanTimer = void 0;
       for (const image of pending) {
         if (!image.isConnected) {
@@ -4096,7 +4918,7 @@ ${button.innerHTML}`)
     };
     const scheduleScan = () => {
       if (scanTimer !== void 0) return;
-      scanTimer = window.setTimeout(scan, SCAN_DELAY_MS);
+      scanTimer = window.setTimeout(scan2, SCAN_DELAY_MS);
     };
     const defer = (image) => {
       image.loading = "lazy";
@@ -4320,9 +5142,9 @@ ${button.innerHTML}`)
      * the same faces on every scan.
      */
     remember(threadId, name, url, owner = name, at = 0) {
-      const normalized2 = normalizeSenderName(name);
-      const ownerKey = normalizeSenderName(owner) || normalized2;
-      if (!threadId || !normalized2 || !url) return false;
+      const normalized3 = normalizeSenderName(name);
+      const ownerKey = normalizeSenderName(owner) || normalized3;
+      if (!threadId || !normalized3 || !url) return false;
       const key = entryKey(threadId, name);
       if (this.ambiguous.has(key)) return false;
       const photo = avatarPhotoId(url);
@@ -4355,8 +5177,8 @@ ${button.innerHTML}`)
      * worse than showing the group photo.
      */
     resolve(threadId, name) {
-      const normalized2 = normalizeSenderName(name);
-      if (!threadId || !normalized2) return { verdict: "no-sender", url: "" };
+      const normalized3 = normalizeSenderName(name);
+      if (!threadId || !normalized3) return { verdict: "no-sender", url: "" };
       const key = entryKey(threadId, name);
       if (this.ambiguous.has(key)) return { verdict: "ambiguous", url: "" };
       const prefix = `${key} `;
@@ -4396,15 +5218,15 @@ ${button.innerHTML}`)
      * held outside the avatar entries so evicting a face cannot resurrect it.
      */
     markAmbiguous(threadId, name) {
-      const normalized2 = normalizeSenderName(name);
-      if (!threadId || !normalized2) return false;
+      const normalized3 = normalizeSenderName(name);
+      if (!threadId || !normalized3) return false;
       const key = entryKey(threadId, name);
       if (this.ambiguous.has(key)) return false;
       this.ambiguous.add(key);
       this.entries.delete(key);
       const prefix = `${threadId}\0`;
       for (const [candidate, entry] of [...this.entries]) {
-        if (!candidate.startsWith(prefix) || entry.owner !== normalized2) continue;
+        if (!candidate.startsWith(prefix) || entry.owner !== normalized3) continue;
         this.entries.delete(candidate);
         this.ambiguous.add(candidate);
       }
@@ -5568,7 +6390,7 @@ ${button.innerHTML}`)
         }
       });
     }
-    function scan() {
+    function scan2() {
       suppressMutations = true;
       try {
         clearMarkers();
@@ -5595,7 +6417,7 @@ ${button.innerHTML}`)
         requestAnimationFrame(() => {
           pending = false;
           lastScanAt = performance.now();
-          scan();
+          scan2();
         });
       }, wait);
     }
@@ -5969,7 +6791,7 @@ ${button.innerHTML}`)
       video.removeAttribute("autoplay");
       if (!video.paused) video.pause();
     };
-    const scan = (root, force = false) => {
+    const scan2 = (root, force = false) => {
       if (!on()) return;
       if (root.nodeType === Node.ELEMENT_NODE) {
         const element2 = root;
@@ -5998,7 +6820,7 @@ ${button.innerHTML}`)
       if (observer) return;
       observer = new MutationObserver((mutations) => {
         for (const mutation of mutations) {
-          for (const node of mutation.addedNodes) scan(node);
+          for (const node of mutation.addedNodes) scan2(node);
         }
       });
       observer.observe(document, { childList: true, subtree: true });
@@ -6010,7 +6832,7 @@ ${button.innerHTML}`)
     const apply = () => {
       if (on()) {
         start();
-        scan(document, true);
+        scan2(document, true);
       } else {
         stop();
       }
@@ -9462,14 +10284,14 @@ ${button.innerHTML}`)
     if (!snapshot.reactButton) return { action: "hover", phase };
     return { action: "open-menu", phase: "menu" };
   }
-  var normalized = (text) => text.replace(/\s+/g, " ").trim();
+  var normalized2 = (text) => text.replace(/\s+/g, " ").trim();
   function bubbleText(label2) {
     const match = / by [^:]*: ([\s\S]*)$/.exec(label2);
-    return match?.[1] ? normalized(match[1]) : "";
+    return match?.[1] ? normalized2(match[1]) : "";
   }
   var bubbleSender = (label2) => / by ([^:]*): /.exec(label2)?.[1]?.trim() ?? "";
   function bubbleMatchesNotification(label2, body) {
-    const raw = normalized(body);
+    const raw = normalized2(body);
     const truncated = /(?:…|\.\.\.)$/.test(raw);
     const preview = raw.replace(/(?:…|\.\.\.)$/, "").trim();
     const text = bubbleText(label2);
@@ -10270,7 +11092,7 @@ ${text}`)) {
       }
       return false;
     };
-    const scan = () => {
+    const scan2 = () => {
       const rows = chatRows();
       if (chatListScrolledFromTop(rows)) return null;
       const seen = /* @__PURE__ */ new Set();
@@ -10290,7 +11112,7 @@ ${text}`)) {
     let emptySince = 0;
     const push = () => {
       const hide = window.__CARRIER_SETTINGS__?.hide_names_avatars === true;
-      const threads = hide ? [] : scan();
+      const threads = hide ? [] : scan2();
       if (threads === null) return;
       if (!hide && threads.length === 0) {
         const now = Date.now();
@@ -11841,7 +12663,7 @@ ${text}`)) {
       if (span.textContent !== glyph) span.textContent = glyph;
       if (span.getAttribute("aria-label") !== glyph) span.setAttribute("aria-label", glyph);
     }
-    function scan(root) {
+    function scan2(root) {
       if (!on() || !root || root.nodeType !== 1) return;
       ensureGlyph(root);
       root.querySelectorAll?.(CANDIDATE_SEL).forEach(ensureGlyph);
@@ -11882,7 +12704,7 @@ ${text}`)) {
         pending = false;
         const roots = [...queuedRoots];
         queuedRoots.clear();
-        roots.forEach(scan);
+        roots.forEach(scan2);
         sweepOrphanGlyphs();
         markReactionGlyphs();
       });

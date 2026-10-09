@@ -60,7 +60,7 @@ use diag::{DIAG_SESSION_CAP, LOG_FILE_MAX_BYTES, parse_diag_payload, sanitize_di
 use download::lookup_download_id;
 use download::{
     downloads_dir, is_allowed_download, is_allowed_download_path, is_unsafe_download,
-    lookup_download, sanitize_filename,
+    lookup_download, sanitize_filename, unique_path,
 };
 use hotkey::reconcile_startup_global_hotkey;
 #[cfg(target_os = "linux")]
@@ -743,6 +743,113 @@ fn send_choose_download_result(
     }
 }
 
+fn batch_folder_result_signature(
+    secret: &str,
+    request: &str,
+    chosen: bool,
+    folder: &str,
+    label: &str,
+) -> Option<String> {
+    #[derive(serde::Serialize)]
+    struct Result<'a> {
+        request: &'a str,
+        chosen: bool,
+        folder: &'a str,
+        label: &'a str,
+    }
+    result_signature(
+        secret,
+        "carrier:choose-batch-folder-result",
+        &Result {
+            request,
+            chosen,
+            folder,
+            label,
+        },
+    )
+}
+
+fn valid_native_request(request: &str) -> bool {
+    request.len() == 32 && request.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn send_batch_folder_result(
+    app: &tauri::AppHandle,
+    window_label: &str,
+    request: &str,
+    selection: Option<(&str, &str)>,
+) {
+    if !valid_native_request(request) {
+        log::warn!("carrier:choose-batch-folder result had an invalid request token");
+        return;
+    }
+    let (folder, label) = selection.unwrap_or(("", ""));
+    let signature = {
+        let state = app.state::<AppState>();
+        state
+            .download_reveal_tokens
+            .lock()
+            .unwrap()
+            .get(window_label)
+            .and_then(|secret| {
+                batch_folder_result_signature(secret, request, selection.is_some(), folder, label)
+            })
+    };
+    let Some(signature) = signature else {
+        return;
+    };
+    let request = serde_json::to_string(request).expect("request serializes");
+    let folder = serde_json::to_string(folder).expect("folder token serializes");
+    let label = serde_json::to_string(label).expect("folder label serializes");
+    let signature = serde_json::to_string(&signature).expect("signature serializes");
+    if let Some(window) = app.get_webview_window(window_label) {
+        let script = format!(
+            "window.dispatchEvent(new CustomEvent('carrier:choose-batch-folder-result', {{ detail: {{ request: {request}, chosen: {}, folder: {folder}, label: {label}, signature: {signature} }} }}));",
+            selection.is_some()
+        );
+        if let Err(error) = window.eval(&script) {
+            log::warn!("failed to report carrier:choose-batch-folder-result: {error}");
+        }
+    }
+}
+
+const BATCH_FOLDER_CAP_PER_WINDOW: usize = 16;
+
+fn remember_batch_folder(
+    folders: &mut HashMap<(String, String), (PathBuf, String)>,
+    window_label: &str,
+    path: PathBuf,
+    label: String,
+) -> Option<String> {
+    if let Some(((_, token), _)) = folders
+        .iter()
+        .find(|((window, _), (existing, _))| window == window_label && existing == &path)
+    {
+        return Some(token.clone());
+    }
+    if folders
+        .keys()
+        .filter(|(window, _)| window == window_label)
+        .count()
+        >= BATCH_FOLDER_CAP_PER_WINDOW
+    {
+        return None;
+    }
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    folders.insert((window_label.to_string(), token.clone()), (path, label));
+    Some(token)
+}
+
+fn batch_folder_for_window(
+    folders: &HashMap<(String, String), (PathBuf, String)>,
+    window_label: &str,
+    token: &str,
+) -> Option<PathBuf> {
+    folders
+        .get(&(window_label.to_string(), token.to_string()))
+        .map(|(path, _)| path.clone())
+}
+
 const PROMPTED_DOWNLOAD_TTL: Duration = Duration::from_secs(10 * 60);
 const PROMPTED_DOWNLOAD_CAP: usize = 32;
 
@@ -1139,6 +1246,7 @@ pub fn run() {
             recent_threads: Mutex::new(Vec::new()),
             download_reveal_tokens: Mutex::new(HashMap::new()),
             prompted_downloads: Mutex::new(HashMap::new()),
+            batch_download_folders: Mutex::new(HashMap::new()),
             signed_action_nonces: Mutex::new(HashMap::new()),
             #[cfg(target_os = "macos")]
             context_menu_activations: Mutex::new(HashMap::new()),
@@ -1472,6 +1580,143 @@ pub fn run() {
                     &msg.request,
                     DownloadChoice::Chosen,
                     NativeResultPhase::Presented,
+                );
+            });
+
+            // Batch downloads choose a directory once. The remote page gets an
+            // opaque per-window token and friendly basename, while the real
+            // path remains in native state. A cancelled picker sends no new
+            // token, leaving any previous frontend selection intact.
+            let batch_folder_handle = app.handle().clone();
+            app.listen_any("carrier:choose-batch-folder", move |event| {
+                #[derive(serde::Deserialize)]
+                struct ChooseFolderMsg {
+                    request: String,
+                }
+                let Ok(signed) = serde_json::from_str::<SignedAction>(event.payload()) else {
+                    return;
+                };
+                let Some(label) = signed_action_window(
+                    &batch_folder_handle,
+                    "carrier:choose-batch-folder",
+                    &signed,
+                ) else {
+                    log::warn!("carrier:choose-batch-folder was not authorized");
+                    return;
+                };
+                let Ok(msg) = serde_json::from_str::<ChooseFolderMsg>(&signed.message) else {
+                    return;
+                };
+                if !valid_native_request(&msg.request) {
+                    return;
+                }
+                let Some(window) = batch_folder_handle.get_webview_window(&label) else {
+                    return;
+                };
+                let result_handle = batch_folder_handle.clone();
+                let result_label = label.clone();
+                let result_request = msg.request;
+                let mut dialog = window
+                    .dialog()
+                    .file()
+                    .set_parent(&window)
+                    .set_title("Choose batch download folder");
+                if let Some(directory) = downloads_dir() {
+                    dialog = dialog.set_directory(directory);
+                }
+                dialog.pick_folder(move |selection| {
+                        let selected = selection
+                            .and_then(|path| path.into_path().ok())
+                            .and_then(|path| std::fs::canonicalize(path).ok())
+                            .filter(|path| path.is_dir());
+                        let response = selected.and_then(|path| {
+                            let label = path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .filter(|name| !name.is_empty())
+                                .unwrap_or("Selected folder")
+                                .to_string();
+                            let token = remember_batch_folder(
+                                &mut result_handle
+                                    .state::<AppState>()
+                                    .batch_download_folders
+                                    .lock()
+                                    .unwrap(),
+                                &result_label,
+                                path,
+                                label.clone(),
+                            );
+                            token.map(|token| (token, label))
+                        });
+                        let borrowed = response
+                            .as_ref()
+                            .map(|(token, label)| (token.as_str(), label.as_str()));
+                        send_batch_folder_result(
+                            &result_handle,
+                            &result_label,
+                            &result_request,
+                            borrowed,
+                        );
+                    });
+            });
+
+            // Reserve each batch blob URL to a fresh unique path inside its
+            // selected directory. This works regardless of the global ask/
+            // Downloads preference because on_download consumes this exact
+            // native reservation first.
+            let prepare_batch_handle = app.handle().clone();
+            app.listen_any("carrier:prepare-batch-download", move |event| {
+                #[derive(serde::Deserialize)]
+                struct PrepareBatchMsg {
+                    folder: String,
+                    url: String,
+                    name: String,
+                    request: String,
+                }
+                let Ok(signed) = serde_json::from_str::<SignedAction>(event.payload()) else {
+                    return;
+                };
+                let Some(label) = signed_action_window(
+                    &prepare_batch_handle,
+                    "carrier:prepare-batch-download",
+                    &signed,
+                ) else {
+                    log::warn!("carrier:prepare-batch-download was not authorized");
+                    return;
+                };
+                let Ok(msg) = serde_json::from_str::<PrepareBatchMsg>(&signed.message) else {
+                    return;
+                };
+                if !valid_native_request(&msg.request) {
+                    return;
+                }
+                let url = url::Url::parse(&msg.url).ok();
+                let name = sanitize_filename(&msg.name);
+                let state = prepare_batch_handle.state::<AppState>();
+                let path = state.batch_download_folders.lock().unwrap();
+                let folder = batch_folder_for_window(&path, &label, &msg.folder);
+                drop(path);
+                let prepared = url.as_ref().is_some_and(|url| {
+                    !is_unsafe_download(&name)
+                        && is_allowed_download(url, &name)
+                        && folder.as_ref().is_some_and(|dir| {
+                            dir.is_dir()
+                                && is_allowed_download_path(url, &dir.join(&name))
+                                && reserve_prompted_download(
+                                    &prepare_batch_handle,
+                                    &label,
+                                    &msg.url,
+                                    unique_path(dir.join(&name)),
+                                )
+                        })
+                });
+                send_native_result(
+                    &prepare_batch_handle,
+                    &label,
+                    "carrier:prepare-batch-download",
+                    "prepared",
+                    &msg.request,
+                    prepared,
                 );
             });
 
@@ -2151,6 +2396,101 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_folder_tokens_are_stable_and_window_scoped() {
+        let mut folders = HashMap::new();
+        let path = PathBuf::from("/native/private/2020");
+        let first =
+            remember_batch_folder(&mut folders, "main", path.clone(), "2020".to_string()).unwrap();
+        let duplicate =
+            remember_batch_folder(&mut folders, "main", path.clone(), "2020".to_string()).unwrap();
+        let other_window =
+            remember_batch_folder(&mut folders, "thread-2", path, "2020".to_string()).unwrap();
+
+        assert_eq!(first, duplicate);
+        assert_ne!(first, other_window);
+        assert_eq!(
+            batch_folder_for_window(&folders, "main", &first),
+            Some(PathBuf::from("/native/private/2020"))
+        );
+        assert_eq!(batch_folder_for_window(&folders, "thread-2", &first), None);
+    }
+
+    #[test]
+    fn batch_folder_token_limit_does_not_replace_existing_selection() {
+        let mut folders = HashMap::new();
+        let original = remember_batch_folder(
+            &mut folders,
+            "main",
+            PathBuf::from("/native/private/2020"),
+            "2020".to_string(),
+        )
+        .unwrap();
+        for index in 1..BATCH_FOLDER_CAP_PER_WINDOW {
+            assert!(
+                remember_batch_folder(
+                    &mut folders,
+                    "main",
+                    PathBuf::from(format!("/native/private/{index}")),
+                    index.to_string(),
+                )
+                .is_some()
+            );
+        }
+        assert!(
+            remember_batch_folder(
+                &mut folders,
+                "main",
+                PathBuf::from("/native/private/new"),
+                "new".to_string(),
+            )
+            .is_none()
+        );
+        assert_eq!(
+            batch_folder_for_window(&folders, "main", &original),
+            Some(PathBuf::from("/native/private/2020"))
+        );
+    }
+
+    #[test]
+    fn chosen_batch_folder_response_binds_request_token_label_and_secret() {
+        let request = "0123456789abcdef0123456789abcdef";
+        let signature =
+            batch_folder_result_signature("test-secret", request, true, "folder-token", "2020")
+                .unwrap();
+
+        assert_ne!(
+            signature,
+            batch_folder_result_signature("other-secret", request, true, "folder-token", "2020")
+                .unwrap()
+        );
+        assert_ne!(
+            signature,
+            batch_folder_result_signature(
+                "test-secret",
+                "fedcba9876543210fedcba9876543210",
+                true,
+                "folder-token",
+                "2020"
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            signature,
+            batch_folder_result_signature("test-secret", request, true, "other-token", "2020")
+                .unwrap()
+        );
+        assert_ne!(
+            signature,
+            batch_folder_result_signature("test-secret", request, true, "folder-token", "2021")
+                .unwrap()
+        );
+        assert_ne!(
+            signature,
+            batch_folder_result_signature("test-secret", request, false, "", "").unwrap()
+        );
+    }
 
     fn timestamp_now() -> u64 {
         SystemTime::now()

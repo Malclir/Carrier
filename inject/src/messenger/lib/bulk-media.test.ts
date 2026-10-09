@@ -121,6 +121,35 @@ describe("BulkMediaQueue", () => {
     expect(harness.saved).toEqual(["one"]);
   });
 
+  test("successful items are deduplicated separately for each destination", async () => {
+    const harness = adapter(["one"]);
+    harness.value.advance = async () => false;
+
+    const downloadsQueue = new BulkMediaQueue(harness.value, "chat-destinations");
+    const downloadsDone = until(downloadsQueue, (state) => state.status === "complete");
+    downloadsQueue.start("older");
+    expect((await downloadsDone).counts).toEqual({ saved: 1, skipped: 0, failed: 0 });
+
+    const chosenFolderQueue = new BulkMediaQueue(
+      harness.value,
+      "chat-destinations",
+      "folder-token-a",
+    );
+    const folderDone = until(chosenFolderQueue, (state) => state.status === "complete");
+    chosenFolderQueue.start("older");
+    expect((await folderDone).counts).toEqual({ saved: 1, skipped: 0, failed: 0 });
+
+    const reopenedFolderQueue = new BulkMediaQueue(
+      harness.value,
+      "chat-destinations",
+      "folder-token-a",
+    );
+    const duplicate = until(reopenedFolderQueue, (state) => state.status === "complete");
+    reopenedFolderQueue.start("older");
+    expect((await duplicate).counts).toEqual({ saved: 0, skipped: 1, failed: 0 });
+    expect(harness.saved).toEqual(["one", "one"]);
+  });
+
   test("navigation exceptions stop with a reason instead of reporting completion", async () => {
     const harness = adapter(["one"]);
     harness.value.advance = async () => {

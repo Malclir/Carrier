@@ -1,26 +1,30 @@
 # Carrier Media local fork
 
-This fork adds a sequential photo/video download control to Carrier's Messenger
-media viewer. It uses the signed-in Messenger page and Carrier's existing native
-download handling. Live sequential photo saving has been verified on this Mac;
-this remains a prototype and does not guarantee a complete chat export.
+This fork adds batch photo/video saving from Carrier's Messenger shared media
+gallery and full-size media viewer. Year batches scan dated gallery sections and
+save only originals Messenger exposes for the selected year. Direction batches
+start with the open item and follow the viewer's Previous or Next controls. This
+remains a prototype and does not guarantee a complete chat export.
 
 ## Try it
 
 1. Open **Carrier Media**, sign in to Facebook, and restore Messenger history if
    Facebook requests your PIN.
-2. Open the target chat, open its shared media gallery, then open a full-size
-   photo or video.
-3. Use the **Batch download** panel at the top left, choose **Previous** or
-   **Next**, and start. The currently open item is included. Files go into your
-   Downloads folder. The top-right download icon still saves just one item.
-4. Keep the viewer open. Pause before interacting with the gallery. A download
-   already being saved may finish after pausing or stopping.
+2. Open the target chat and its shared media gallery. Use **Whole year** to
+   select a year and save its dated photos and videos. The suggested year comes
+   from visible gallery tiles when possible; edit it before starting if needed.
+3. To batch from one item, open a full-size photo or video, choose **From open
+   photo**, select **Previous** or **Next**, and start. This includes the open
+   item and follows the viewer's controls.
+4. The destination starts as **Downloads**. Choose **Choose folder** to pick a
+   different native folder, such as `Downloads/2020`; the panel shows its name,
+   not its path. Pause before interacting with the gallery during a year batch.
+   A download already being saved may finish after pausing or stopping.
 
 The selected direction follows Messenger's viewer buttons. It does not imply
 chronological order. To cover both sides of a starting item, run in each
-direction; successful items are deduplicated during the current page session.
-Existing local files are never overwritten.
+direction. Successfully saved items are deduplicated per chat and destination
+during the current page session. Existing local files are never overwritten.
 
 The control reports files saved only after Carrier confirms native completion.
 If it stops because navigation cannot be recognized, that does not establish
@@ -29,8 +33,15 @@ not-yet-restored media may prevent a complete export. This version does not
 collect voice messages, arbitrary attachments, or message text. Carrier's
 existing 512 MiB per-file limit applies.
 
-If Settings is configured to ask where to save every download, change its
-download setting to **Downloads folder** before starting a batch.
+If Settings is configured to ask where to save every download, choose a batch
+folder first. That folder is used for this batch without changing the per-file
+ask setting. Ordinary downloads continue to follow the setting.
+
+Custom destinations need a build with the native batch-folder picker. If Carrier
+reports that the feature needs a newer version, build the updated app and restart it.
+Messenger only exposes part of a chat's gallery at a time; a year scan can stop
+at the oldest loaded section and does not promise complete history. Items with
+unknown dates are not included in a year batch.
 
 ## Build locally on this Mac
 
@@ -48,7 +59,23 @@ and logs, and disables automatic upstream update checks. This diagnostics build
 blocks upstream release updates. The original Carrier licensing and attribution
 remain in place.
 
-## Validation on this Mac (October 9, 2026)
+## Year and folder validation (October 9, 2026)
+
+- Full frontend check passed: lint, TypeScript, 716 tests (16 optional browser
+  tests skipped), and regenerated injection bundles.
+- The focused Chrome gallery fixture passed separately, covering adjacent-year
+  exclusion, delayed loading, pause/cancel, destination-scoped deduplication,
+  and a viewer that refuses to close.
+- Rust formatting, Clippy, and all 319 library tests passed.
+- A live 2020 year batch saved three nonempty images into a folder selected with
+  the native picker, reported zero failures, and paused with the viewer closed.
+- A complete year export and live video saving have not yet been verified.
+  Windows needs a new build from the existing Windows installer workflow.
+
+## Earlier direction-batch prototype validation (October 9, 2026)
+
+These checks were recorded before year scanning and folder selection were
+integrated. Rebuild and restart Carrier to validate the current year workflow.
 
 - Native app built and launched successfully; login survived the update.
 - Rust formatting, Clippy, and all 316 native unit tests passed.

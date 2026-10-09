@@ -216,6 +216,7 @@ export class BulkMediaQueue {
   constructor(
     private readonly adapter: BulkMediaAdapter,
     private readonly chatKey: string,
+    private readonly destinationKey = "downloads",
   ) {}
 
   get state(): BulkMediaSnapshot {
@@ -316,8 +317,16 @@ export class BulkMediaQueue {
 
   private async run(generation: number): Promise<void> {
     const visited = new Set<string>();
-    const completed = completedMediaByChat.get(this.chatKey) || new Set<string>();
-    completedMediaByChat.set(this.chatKey, completed);
+    let destinations = completedMediaByChat.get(this.chatKey);
+    if (!destinations) {
+      destinations = new Map<string, Set<string>>();
+      completedMediaByChat.set(this.chatKey, destinations);
+    }
+    let completed = destinations.get(this.destinationKey);
+    if (!completed) {
+      completed = new Set<string>();
+      destinations.set(this.destinationKey, completed);
+    }
     try {
       while (generation === this.generation) {
         if (!(await this.waitWhilePaused(generation))) return;
@@ -403,4 +412,4 @@ export class BulkMediaQueue {
   }
 }
 
-const completedMediaByChat = new Map<string, Set<string>>();
+const completedMediaByChat = new Map<string, Map<string, Set<string>>>();

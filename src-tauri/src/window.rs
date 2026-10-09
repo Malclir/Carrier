@@ -394,6 +394,11 @@ fn build_app_window_with_render_budget(
                     .lock()
                     .unwrap()
                     .retain(|(window, _), _| window != &token_cleanup_label);
+                state
+                    .batch_download_folders
+                    .lock()
+                    .unwrap()
+                    .retain(|(window, _), _| window != &token_cleanup_label);
                 #[cfg(target_os = "macos")]
                 {
                     state
@@ -1235,6 +1240,40 @@ fn init_script(
       'carrier:choose-download', 'chosen',
       'download cancelled', 'download picker timed out',
       {{ url: url, name: name }}, true, 'cancelled', 'download rejected'
+    );
+  }};
+  var carrierChooseBatchFolder = function () {{
+    if (!carrierAuthorizedEmit || !carrierVerifyResult) {{
+      return NativePromise.reject(new Error('batch folder picker unavailable; update Carrier'));
+    }}
+    var request = carrierNativeRequest();
+    var resultEvent = 'carrier:choose-batch-folder-result';
+    return new NativePromise(function (resolve, reject) {{
+      var cleanup = function () {{
+        nativeClearTimeout(timeout);
+        nativeReflectApply(nativeWindowRemoveEventListener, window, [resultEvent, finish]);
+      }};
+      var finish = async function (event) {{
+        var detail = event && event.detail;
+        if (!detail || detail.request !== request || typeof detail.chosen !== 'boolean') return;
+        if (typeof detail.folder !== 'string' || typeof detail.label !== 'string') return;
+        var result = {{ request: request, chosen: detail.chosen, folder: detail.folder, label: detail.label }};
+        if (!await carrierVerifyResult(resultEvent, result, detail.signature)) return;
+        cleanup();
+        if (result.chosen && result.folder && result.label) resolve({{ folder: result.folder, label: result.label }});
+        else reject(new Error('folder selection cancelled'));
+      }};
+      var timeout = nativeSetTimeout(function () {{ cleanup(); reject(new Error('folder picker timed out; try again')); }}, 120000);
+      nativeReflectApply(nativeWindowAddEventListener, window, [resultEvent, finish]);
+      carrierAuthorizedEmit('carrier:choose-batch-folder', {{ request: request }}).catch(function (error) {{ cleanup(); reject(error); }});
+    }});
+  }};
+  var carrierPrepareBatchDownload = function (folder, url, name) {{
+    return carrierNativeCall(
+      'carrier:prepare-batch-download', 'prepared',
+      'batch download was rejected', 'batch download preparation timed out; update Carrier',
+      {{ folder: folder, url: url, name: name }}, false, undefined,
+      'batch download preparation failed'
     );
   }};
   var carrierShareDownload = function (downloadId, x, y, action) {{

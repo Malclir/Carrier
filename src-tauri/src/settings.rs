@@ -295,6 +295,9 @@ pub(crate) struct AppState {
     /// User-selected save paths awaiting the matching WebView download. The
     /// remote page sees only the URL key, never the filesystem path.
     pub(crate) prompted_downloads: Mutex<HashMap<(String, String), (PathBuf, Instant)>>,
+    /// Per-window opaque references to batch destination folders. The page
+    /// receives only each token and basename label; native paths stay here.
+    pub(crate) batch_download_folders: Mutex<HashMap<(String, String), (PathBuf, String)>>,
     /// Recently consumed signed-action nonces and their insertion times. The
     /// authenticated action timestamp lets old entries expire without allowing
     /// a captured action to be replayed.

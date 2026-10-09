@@ -104,6 +104,16 @@ declare const carrierPrepareDownload: (action: string, url: string) => Promise<u
 /** Ask the native shell to reserve a user-selected path for this download. */
 declare const carrierChooseDownload: (url: string, name: string) => Promise<unknown>;
 
+/** Pick a native batch destination. The folder field is an opaque per-window token. */
+declare const carrierChooseBatchFolder: () => Promise<{ folder: string; label: string }>;
+
+/** Reserve one blob download URL inside a previously selected batch folder. */
+declare const carrierPrepareBatchDownload: (
+  folder: string,
+  url: string,
+  name: string,
+) => Promise<unknown>;
+
 /**
  * Same closure-scoped credential, second action: open the macOS share sheet
  * for a just-downloaded file, anchored at viewport fractions (0..1 top-left).

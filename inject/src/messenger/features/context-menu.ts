@@ -213,6 +213,7 @@ export async function downloadSrc(
   src: string,
   fallbackName: string,
   action?: string,
+  batchFolder?: string,
 ): Promise<{ id: string; url: string }> {
   // Fetch into a same-origin blob so the `download` attribute is honoured (it's
   // ignored for cross-origin URLs) and so we can derive the real extension.
@@ -237,7 +238,12 @@ export async function downloadSrc(
   document.body.appendChild(a);
   try {
     if (action) await carrierPrepareDownload(action, href);
-    if (window.__CARRIER_SETTINGS__?.download_behavior === "ask") {
+    if (batchFolder) {
+      if (typeof carrierPrepareBatchDownload !== "function") {
+        throw new Error("batch folder downloads require a newer Carrier version");
+      }
+      await carrierPrepareBatchDownload(batchFolder, href, name);
+    } else if (window.__CARRIER_SETTINGS__?.download_behavior === "ask") {
       await carrierChooseDownload(href, name);
     }
     const completion = waitForNativeDownload(window, href, carrierVerifyResult);
