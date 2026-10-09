@@ -379,6 +379,24 @@ fn authorize_signed_action(
     event: &str,
     signed: &SignedAction,
 ) -> Option<String> {
+    authorize_signed_action_at(
+        tokens,
+        used_nonces,
+        event,
+        signed,
+        SystemTime::now(),
+        Instant::now(),
+    )
+}
+
+fn authorize_signed_action_at(
+    tokens: &HashMap<String, String>,
+    used_nonces: &mut HashMap<String, HashMap<String, Instant>>,
+    event: &str,
+    signed: &SignedAction,
+    wall_now: SystemTime,
+    now: Instant,
+) -> Option<String> {
     if signed.message.len() > signed_action_message_limit(event)
         || signed.nonce.len() != 32
         || !signed.nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -387,7 +405,6 @@ fn authorize_signed_action(
         return None;
     }
     let issued_at = UNIX_EPOCH.checked_add(Duration::from_millis(signed.timestamp))?;
-    let wall_now = SystemTime::now();
     if issued_at > wall_now.checked_add(SIGNED_ACTION_FUTURE_SKEW)?
         || wall_now
             .duration_since(issued_at)
@@ -408,7 +425,6 @@ fn authorize_signed_action(
     if !claim_large_signed_action(event, signed.message.len(), &label) {
         return None;
     }
-    let now = Instant::now();
     let window_nonces = used_nonces.entry(label.clone()).or_default();
     window_nonces.retain(|_, inserted| now.duration_since(*inserted) <= SIGNED_ACTION_MAX_AGE);
     if window_nonces.contains_key(&signed.nonce) || window_nonces.len() >= SIGNED_ACTION_NONCE_CAP {
@@ -2428,18 +2444,30 @@ mod tests {
         let tokens = HashMap::from([("main".to_string(), "main-secret".to_string())]);
         let event = "carrier:context-menu";
         let message = "[]";
-        let timestamp = timestamp_now();
+        let wall_now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let timestamp = wall_now.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         let nonce = "0123456789abcdef0123456789abcdef";
         let signed = signed_action("main-secret", event, message, nonce, timestamp);
-        let stale = Instant::now() - SIGNED_ACTION_MAX_AGE - Duration::from_secs(1);
+        let monotonic_start = Instant::now();
+        let stale = monotonic_start;
+        let monotonic_now = monotonic_start + SIGNED_ACTION_MAX_AGE + Duration::from_secs(1);
         let mut used = HashMap::from([(
             "main".to_string(),
             HashMap::from([(nonce.to_string(), stale)]),
         )]);
         assert_eq!(
-            authorize_signed_action(&tokens, &mut used, event, &signed).as_deref(),
+            authorize_signed_action_at(
+                &tokens,
+                &mut used,
+                event,
+                &signed,
+                wall_now,
+                monotonic_now,
+            )
+            .as_deref(),
             Some("main")
         );
+        assert_eq!(used["main"][nonce], monotonic_now);
 
         let expired_timestamp = timestamp - SIGNED_ACTION_MAX_AGE.as_millis() as u64 - 1;
         let expired = signed_action(
@@ -2450,12 +2478,19 @@ mod tests {
             expired_timestamp,
         );
         assert_eq!(
-            authorize_signed_action(&tokens, &mut used, event, &expired),
+            authorize_signed_action_at(
+                &tokens,
+                &mut used,
+                event,
+                &expired,
+                wall_now,
+                monotonic_now,
+            ),
             None
         );
 
         let full = (0..SIGNED_ACTION_NONCE_CAP)
-            .map(|index| (format!("{index:032x}"), Instant::now()))
+            .map(|index| (format!("{index:032x}"), monotonic_now))
             .collect();
         let mut used = HashMap::from([("main".to_string(), full)]);
         let overflow = signed_action(
@@ -2466,49 +2501,81 @@ mod tests {
             timestamp,
         );
         assert_eq!(
-            authorize_signed_action(&tokens, &mut used, event, &overflow),
+            authorize_signed_action_at(
+                &tokens,
+                &mut used,
+                event,
+                &overflow,
+                wall_now,
+                monotonic_now,
+            ),
             None
         );
         assert_eq!(used["main"].len(), SIGNED_ACTION_NONCE_CAP);
+
+        used.get_mut("main").unwrap().insert(
+            "00000000000000000000000000000000".to_string(),
+            monotonic_start,
+        );
+        assert_eq!(
+            authorize_signed_action_at(
+                &tokens,
+                &mut used,
+                event,
+                &overflow,
+                wall_now,
+                monotonic_now,
+            )
+            .as_deref(),
+            Some("main")
+        );
+        assert_eq!(used["main"].len(), SIGNED_ACTION_NONCE_CAP);
+        assert_eq!(
+            used["main"]["ffffffffffffffffffffffffffffffff"],
+            monotonic_now
+        );
     }
 
     #[test]
     fn stale_context_actions_are_pruned_without_invalidating_selected_actions() {
-        let now = Instant::now();
+        let start = Instant::now();
+        let now = start + CONTEXT_MENU_ACTIVATION_TTL + Duration::from_secs(1);
         assert!(context_menu_activation_is_current(
-            ContextMenuActivation::Selected(now),
-            now
+            ContextMenuActivation::Selected(start),
+            start
+        ));
+        assert!(context_menu_activation_is_current(
+            ContextMenuActivation::Selected(start),
+            start + CONTEXT_MENU_ACTIVATION_TTL
         ));
         assert!(!context_menu_activation_is_current(
             ContextMenuActivation::Pending,
             now
         ));
         assert!(!context_menu_activation_is_current(
-            ContextMenuActivation::Selected(
-                now - CONTEXT_MENU_ACTIVATION_TTL - Duration::from_secs(1)
-            ),
+            ContextMenuActivation::Selected(start),
             now,
         ));
         assert!(context_menu_activation_is_current(
             ContextMenuActivation::Claimed {
                 download_id: None,
-                claimed_at: now,
+                claimed_at: start,
             },
-            now + CONTEXT_MENU_CLAIM_TTL
+            start + CONTEXT_MENU_CLAIM_TTL
         ));
         assert!(!context_menu_activation_is_current(
             ContextMenuActivation::Claimed {
                 download_id: None,
-                claimed_at: now,
+                claimed_at: start,
             },
-            now + CONTEXT_MENU_CLAIM_TTL + Duration::from_secs(1)
+            start + CONTEXT_MENU_CLAIM_TTL + Duration::from_secs(1)
         ));
         assert!(!context_menu_activation_can_be_claimed(
             ContextMenuActivation::Claimed {
                 download_id: None,
-                claimed_at: now,
+                claimed_at: start,
             },
-            now
+            start
         ));
     }
 
@@ -2585,16 +2652,17 @@ mod tests {
 
     #[test]
     fn pending_and_stale_activations_cannot_be_claimed_or_consumed() {
-        let now = Instant::now();
+        let start = Instant::now();
+        let stale_now = start + CONTEXT_MENU_ACTIVATION_TTL + Duration::from_secs(1);
         let key = activation_key();
 
         let mut pending = HashMap::from([(key.clone(), ContextMenuActivation::Pending)]);
-        assert!(!claim_activation(&mut pending, &key, now));
-        assert!(!consume_activation(&mut pending, &key, None, now));
+        assert!(!claim_activation(&mut pending, &key, start));
+        assert!(!consume_activation(&mut pending, &key, None, start));
 
-        let stale_at = now - CONTEXT_MENU_ACTIVATION_TTL - Duration::from_secs(1);
-        let mut stale = HashMap::from([(key.clone(), ContextMenuActivation::Selected(stale_at))]);
-        assert!(!consume_activation(&mut stale, &key, None, now));
+        let mut stale = HashMap::from([(key.clone(), ContextMenuActivation::Selected(start))]);
+        assert!(!claim_activation(&mut stale, &key, stale_now));
+        assert!(!consume_activation(&mut stale, &key, None, stale_now));
         // A stale entry is pruned on the failed consume.
         assert!(stale.is_empty());
     }
