@@ -1,0 +1,3 @@
+# Keep text files in LF format on every platform so Windows checkouts pass
+# formatting checks and generated assets stay consistent. Preserve binary files.
+* text=auto eol=lf
