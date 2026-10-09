@@ -2,6 +2,7 @@ import { beforeAll, expect, test } from "bun:test";
 import { runInNewContext } from "node:vm";
 import { build } from "esbuild";
 import type { monitorRealtimeHealth } from "../features/realtime-health";
+import { nativeRealtimeStatus } from "./auto-refresh";
 import {
   REALTIME_CONNECT_GRACE_MS,
   REALTIME_NEVER_CONNECTED_MS,
@@ -102,7 +103,10 @@ test("successful worker probes cannot cancel recovery for a disconnected encrypt
     socket.dispatchEvent(new Event("open"));
     return {
       tracker,
+      nativeStatus: () =>
+        nativeRealtimeStatus(tracker.status(now), monitor.isRecoveryHealthy(), true, false),
       isVerifiedHealthy: monitor.isVerifiedHealthy,
+      isRecoveryHealthy: monitor.isRecoveryHealthy,
       check: async () => {
         socket.dispatchEvent(new Event("message"));
         monitor.check();
@@ -110,6 +114,30 @@ test("successful worker probes cannot cancel recovery for a disconnected encrypt
       },
     };
   };
+  // Socket-only deployments can restore recovery budgets without worker APIs.
+  bridgeAvailable = moduleAvailable = setupModuleAvailable = false;
+  const fallback = createMonitor("2000");
+  await fallback.check();
+  expect(fallback.isVerifiedHealthy()).toBe(false);
+  expect(fallback.isRecoveryHealthy()).toBe(true);
+  expect(fallback.nativeStatus()).toBe("ok");
+  now += REALTIME_NEVER_CONNECTED_MS;
+  expect(fallback.isRecoveryHealthy()).toBe(false);
+  await fallback.check();
+  expect(fallback.nativeStatus()).toBe("ok");
+  // Once an encrypted worker appears, page traffic cannot replace its proof,
+  // even if those private APIs subsequently disappear.
+  setupModuleAvailable = setupInProgress = true;
+  await fallback.check();
+  expect(fallback.nativeStatus()).toBe("pending");
+  setupModuleAvailable = setupInProgress = false;
+  await fallback.check();
+  expect(fallback.isRecoveryHealthy()).toBe(false);
+  expect(fallback.nativeStatus()).toBe("pending");
+  const otherAccount = createMonitor("2001");
+  await otherAccount.check();
+  expect(otherAccount.nativeStatus()).toBe("ok");
+  bridgeAvailable = moduleAvailable = setupModuleAvailable = true;
   let { tracker, check } = createMonitor();
   await check();
   expect(tracker.status(now)).toBe("ok");
@@ -180,6 +208,7 @@ test("successful worker probes cannot cancel recovery for a disconnected encrypt
   connected = true;
   await fresh.check();
   expect(fresh.isVerifiedHealthy()).toBe(true);
+  expect(fresh.nativeStatus()).toBe("ok");
   now += REALTIME_CONNECT_GRACE_MS;
   expect(fresh.isVerifiedHealthy()).toBe(false);
   await fresh.check();
@@ -205,9 +234,11 @@ test("successful worker probes cannot cancel recovery for a disconnected encrypt
     now += REALTIME_NEVER_CONNECTED_MS - 1;
     await starting.check();
     expect(starting.tracker.status(now)).toBe("ok");
+    expect(starting.nativeStatus()).toBe("pending");
     now += 1;
     await starting.check();
     expect(starting.tracker.status(now)).toBe("stale");
+    expect(starting.nativeStatus()).toBe("stale");
     expect(starting.isVerifiedHealthy()).toBe(false);
   }
   for (const missingSetupModule of [false, true]) {
@@ -247,6 +278,7 @@ function stateProbeFixture() {
   const timers = new Map<number, { due: number; run: () => void }>();
   const listeners = new Set<(value: unknown) => void>();
   const requests: string[] = [];
+  const storage = new Map<string, string>();
   let identityChanges = 0;
   const tracker = new RealtimeRecoveryTracker(now);
   const schedule = (run: () => void, delay: number) => {
@@ -298,7 +330,10 @@ function stateProbeFixture() {
         return `c_user=${account}`;
       },
     },
-    localStorage: { getItem: () => null, setItem: () => {} },
+    localStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, value),
+    },
     location: { href: "https://www.facebook.com/messages/" },
     Date: { now: () => now },
     performance: { now: () => now },
@@ -322,6 +357,7 @@ function stateProbeFixture() {
       return identityChanges;
     },
     requests,
+    storage,
     listeners,
     tracker,
     monitor,
@@ -346,6 +382,12 @@ function stateProbeFixture() {
     },
     changeState: () => {
       modules.WACommsConnectionState = { WACommsConnectionState: { ...connection } };
+    },
+    openSocket: () => {
+      const socket = Reflect.construct(environment.window.WebSocket, [
+        "wss://edge-chat.facebook.com/chat",
+      ]) as EventTarget;
+      socket.dispatchEvent(new Event("open"));
     },
     complete: () => complete?.(),
     reject: (error: unknown) => reject?.(error),
@@ -385,6 +427,30 @@ test("RPC replies and a cached connected value cannot hide missing state deliver
   expect(fixture.tracker.needsRecovery(24_000)).toBe(false);
   expect(fixture.listeners.size).toBe(0);
 });
+
+for (const replacement of ["changeWorker", "changeState"] as const) {
+  test(`retained worker APIs cannot establish a new account before ${replacement}`, async () => {
+    const fixture = stateProbeFixture();
+    fixture.setMode("drop");
+    await fixture.probe();
+    expect(fixture.storage.size).toBe(0);
+    await fixture.advance(8000);
+    fixture.setMode("normal");
+    await fixture.probe();
+    expect(fixture.storage.size).toBe(1);
+    fixture.changeAccount();
+    fixture.openSocket();
+    await fixture.probe();
+    expect(fixture.requests).toHaveLength(2);
+    expect(fixture.monitor.isVerifiedHealthy()).toBe(false);
+    expect(fixture.monitor.isRecoveryHealthy()).toBe(true);
+    expect(fixture.storage.size).toBe(1);
+    fixture[replacement]();
+    await fixture.probe();
+    expect(fixture.monitor.isVerifiedHealthy()).toBe(true);
+    expect(fixture.storage.size).toBe(2);
+  });
+}
 
 test("worker probes retain native deadlines after Facebook replaces page timers", async () => {
   const fixture = stateProbeFixture();
@@ -519,6 +585,9 @@ test("only fresh encrypted state or a new worker clears a confirmed disconnect",
   expect(fixture.tracker.needsRecovery(105_000)).toBe(true);
   fixture.setMode("normal");
   fixture.changeAccount();
+  await fixture.probe();
+  expect(fixture.monitor.isVerifiedHealthy()).toBe(false);
+  fixture.changeState();
   await fixture.probe();
   expect(fixture.monitor.isVerifiedHealthy()).toBe(true);
 });

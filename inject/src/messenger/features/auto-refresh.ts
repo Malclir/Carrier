@@ -6,6 +6,7 @@
 import { diag, invoke } from "../bridge";
 import {
   canReplacePendingRefresh,
+  nativeRealtimeStatus,
   type PowerSnapshot,
   PowerStateTracker,
   type ScheduledRefreshReason,
@@ -147,6 +148,7 @@ export function initAutoRefresh() {
   let rateLimitRetryGrantUntil = 0;
   // Set once in-place worker repair has failed or cannot act.
   let silentRecoveryFailed = false;
+  let recoveryHealthy = () => false;
   const realtimeReport = () => {
     const status = realtimeStatus();
     // An overdue termination or shutdown can still mutate Messenger's worker.
@@ -154,9 +156,12 @@ export function initAutoRefresh() {
     const workerMutationPending =
       workerRecovery.phase === "dedicated-termination" ||
       workerRecovery.phase === "shared-shutdown";
-    return ["stale", "never"].includes(status) && (!silentRecoveryFailed || workerMutationPending)
-      ? "managed"
-      : status;
+    return nativeRealtimeStatus(
+      status,
+      recoveryHealthy(),
+      silentRecoveryFailed,
+      workerMutationPending,
+    );
   };
   const emitHeartbeat = (requestRateLimitRetry = false) => {
     if (typeof heartbeatId !== "number") return;
@@ -195,9 +200,6 @@ export function initAutoRefresh() {
   };
   const emitProtectionChange = () => {
     if (heartbeatProtection() !== lastHeartbeatProtection) emitHeartbeat();
-  };
-  window.__carrierHeartbeat = (expectedId) => {
-    if (expectedId === heartbeatId) emitHeartbeat();
   };
   window.addEventListener("input", emitProtectionChange, true);
   window.addEventListener("carrier:protection-change", emitProtectionChange);
@@ -328,6 +330,7 @@ export function initAutoRefresh() {
     },
     onWorkerChanged: () => silentRecovery.resetSettle(),
   });
+  recoveryHealthy = realtime.isRecoveryHealthy;
 
   const silentRecovery = createSilentRecovery({
     blocked: (manual) =>
@@ -339,13 +342,19 @@ export function initAutoRefresh() {
       !isMessengerContentPath(location.pathname) ||
       onFacebookErrorPage(),
     needsRecovery: () => ["stale", "never"].includes(realtimeStatus()),
-    isHealthy: () => realtimeStatus() === "ok" && realtime.isVerifiedHealthy(),
+    isHealthy: () => realtimeStatus() === "ok" && realtime.isRecoveryHealthy(),
     check: () => realtime.check(),
   });
   // These events are reasons to check sync, not evidence that it is broken.
   const noteLifecycle = () => {
     sampleSyncProcessing(processingActive());
     if (!systemSleeping && navigator.onLine && rateLimitRemainingMs() <= 0) realtime.check();
+  };
+  window.__carrierHeartbeat = (expectedId) => {
+    if (expectedId !== heartbeatId) return;
+    // Native pings continue when hidden-page timers are throttled.
+    noteLifecycle();
+    emitHeartbeat();
   };
   window.addEventListener("focus", noteLifecycle);
   window.addEventListener("blur", noteLifecycle);

@@ -1,4 +1,22 @@
+import type { RealtimeStatus } from "./realtime-health";
+
 export type ScheduledRefreshReason = "rate-limit" | "rate-limit-manual" | "manual";
+
+/** Recovery requires the expected transport, not unrelated page MQTT traffic. */
+export function nativeRealtimeStatus(
+  status: RealtimeStatus,
+  transportConfirmed: boolean,
+  silentRecoveryFailed: boolean,
+  workerMutationPending: boolean,
+): RealtimeStatus | "managed" {
+  if (status === "ok" && !transportConfirmed) return "pending";
+  if (
+    (status === "stale" || status === "never") &&
+    (!silentRecoveryFailed || workerMutationPending)
+  )
+    return "managed";
+  return status;
+}
 
 export interface PowerSnapshot {
   sleeping: boolean;
