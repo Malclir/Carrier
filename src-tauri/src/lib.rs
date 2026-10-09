@@ -915,9 +915,9 @@ pub(crate) fn context_menu_activation_is_current(
         ContextMenuActivation::Selected(selected_at) => now
             .checked_duration_since(selected_at)
             .is_some_and(|age| age <= CONTEXT_MENU_ACTIVATION_TTL),
-        ContextMenuActivation::Claimed { claimed_at, .. } => !now
+        ContextMenuActivation::Claimed { claimed_at, .. } => now
             .checked_duration_since(claimed_at)
-            .is_some_and(|age| age > CONTEXT_MENU_CLAIM_TTL),
+            .is_none_or(|age| age <= CONTEXT_MENU_CLAIM_TTL),
     }
 }
 
@@ -935,9 +935,9 @@ const DEFAULT_MCP_SOCKET: &str = "/tmp/tauri-mcp.sock";
 /// Window/app title. Debug builds are marked so a dev build (e.g. the
 /// tauri-mcp one) isn't mistaken for a release install.
 const APP_TITLE: &str = if cfg!(debug_assertions) {
-    "Carrier (debug)"
+    "Carrier Media (debug)"
 } else {
-    "Carrier"
+    "Carrier Media"
 };
 
 /// Injected assets (see `inject/`).

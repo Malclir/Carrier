@@ -470,12 +470,12 @@
       this.lastSample = void 0;
       this.hasFrame = false;
     }
-    sample(visible) {
+    sample(visible2) {
       const now = this.now();
-      if (!visible || this.lastSample !== void 0 && now - this.lastSample > FRAME_TIMEOUT_MS) {
+      if (!visible2 || this.lastSample !== void 0 && now - this.lastSample > FRAME_TIMEOUT_MS) {
         this.reset();
       }
-      if (!visible) return { state: "pending", wait_ms: 0 };
+      if (!visible2) return { state: "pending", wait_ms: 0 };
       this.lastSample = now;
       if (!this.request) {
         const request = {
@@ -2203,7 +2203,7 @@ ${button.innerHTML}`)
       if (typeof heartbeatId !== "number") return;
       const protectedNow = heartbeatProtection();
       const contentPresent = messengerContentPresent();
-      const visible = !document.hidden && !systemSleeping;
+      const visible2 = !document.hidden && !systemSleeping;
       lastHeartbeatProtection = protectedNow;
       invoke("plugin:event|emit", {
         event: "carrier:webview-heartbeat",
@@ -2213,11 +2213,11 @@ ${button.innerHTML}`)
           content_present: contentPresent,
           render: {
             ...renderProbe.sample(
-              visible && document.readyState === "complete" && contentPresent && isMessengerContentPath(location.pathname)
+              visible2 && document.readyState === "complete" && contentPresent && isMessengerContentPath(location.pathname)
             ),
             document_epoch_ms: documentEpochMs,
             document_age_ms: Math.round(nativeNow2()),
-            visible,
+            visible: visible2,
             focused: document.hasFocus(),
             content_page: isMessengerContentPath(location.pathname)
           },
@@ -2434,55 +2434,510 @@ ${button.innerHTML}`)
     }, 5e3);
   }
 
-  // inject/src/messenger/lib/composer-keys.ts
-  function shouldKeepEnterInComposer(state2) {
-    if (state2.key !== "Enter") return false;
-    if (state2.isComposing || state2.compositionActive || state2.keyCode === 229) return true;
-    return state2.requireAccelerator && !state2.acceleratorPressed && !state2.shiftKey;
+  // inject/src/messenger/lib/bulk-media-viewer.ts
+  var DIALOG = '[role="dialog"]';
+  var HIDDEN = '[hidden], [aria-hidden="true"], [inert]';
+  function visible(element2) {
+    if (element2.closest(HIDDEN)) return false;
+    const rect = element2.getBoundingClientRect();
+    const style = getComputedStyle(element2);
+    return rect.width > 0 && rect.height > 0 && style.visibility === "visible";
+  }
+  function owns(root, element2) {
+    if (!root.contains(element2)) return false;
+    const nearestDialog = element2.closest(DIALOG);
+    return !nearestDialog || nearestDialog === root || !root.contains(nearestDialog);
+  }
+  function normalizedLabel(element2) {
+    return [
+      element2.getAttribute("aria-label") || "",
+      element2.getAttribute("title") || "",
+      element2.textContent || ""
+    ].join(" ").toLocaleLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "").trim();
+  }
+  function hasControl(root, pattern) {
+    return [...root.querySelectorAll('button, [role="button"], a[href]')].some(
+      (control) => owns(root, control) && visible(control) && pattern.test(normalizedLabel(control))
+    );
+  }
+  function hasThumbnailStrip(root) {
+    return [
+      ...root.querySelectorAll(
+        '[role="tablist"], [aria-label*="thumbnail" i], [aria-label*="filmstrip" i]'
+      )
+    ].some((strip) => {
+      if (!owns(root, strip) || !visible(strip)) return false;
+      const items = strip.querySelectorAll('button, [role="tab"], [role="button"]');
+      return items.length >= 2;
+    });
+  }
+  function hasMainMedia(root) {
+    const bounds = root.getBoundingClientRect();
+    const widthDenominator = Math.min(bounds.width, innerWidth);
+    const heightDenominator = Math.min(bounds.height, innerHeight);
+    if (widthDenominator <= 0 || heightDenominator <= 0) return false;
+    return [...root.querySelectorAll("img, video")].some(
+      (media) => {
+        if (!owns(root, media) || !visible(media)) return false;
+        const rect = media.getBoundingClientRect();
+        const visibleWidth = Math.max(
+          0,
+          Math.min(rect.right, bounds.right, innerWidth) - Math.max(rect.left, bounds.left, 0)
+        );
+        const visibleHeight = Math.max(
+          0,
+          Math.min(rect.bottom, bounds.bottom, innerHeight) - Math.max(rect.top, bounds.top, 0)
+        );
+        const widthRatio = visibleWidth / widthDenominator;
+        const heightRatio = visibleHeight / heightDenominator;
+        return widthRatio >= 0.15 && heightRatio >= 0.15 || widthRatio >= 0.5 || heightRatio >= 0.5;
+      }
+    );
+  }
+  function hasOwnOriginalDownload(root) {
+    return [...root.querySelectorAll("a[download][href]")].some((anchor) => {
+      if (!owns(root, anchor) || !visible(anchor) || anchor.hasAttribute("data-carrier-native-download"))
+        return false;
+      try {
+        return new URL(anchor.href, location.href).protocol === "https:";
+      } catch {
+        return false;
+      }
+    });
+  }
+  function fillsViewport(root) {
+    const rect = root.getBoundingClientRect();
+    const visibleWidth = Math.max(0, Math.min(rect.right, innerWidth) - Math.max(rect.left, 0));
+    const visibleHeight = Math.max(0, Math.min(rect.bottom, innerHeight) - Math.max(rect.top, 0));
+    return innerWidth > 0 && innerHeight > 0 && visibleWidth >= innerWidth * 0.75 && visibleHeight >= innerHeight * 0.7;
+  }
+  function isSafeViewerRoot(root) {
+    if (!visible(root) || !fillsViewport(root)) return false;
+    if (root.closest("[data-carrier-shortcuts-overlay]") || !hasMainMedia(root)) return false;
+    if (!hasOwnOriginalDownload(root)) return false;
+    if ([...root.querySelectorAll('[role="navigation"], [contenteditable="true"]')].some(
+      (el) => owns(root, el)
+    ))
+      return false;
+    if (!hasControl(root, /(?:^|\W)close(?:$|\W)/u)) return false;
+    const hasNavigation = hasControl(root, /(?:^|\W)(?:previous|prev|precedent|precedente)(?:$|\W)/u) || hasControl(root, /(?:^|\W)(?:next|suivant|suivante)(?:$|\W)/u);
+    return hasNavigation || hasThumbnailStrip(root);
+  }
+  function findRolelessMediaViewer() {
+    const anchors = [...document.querySelectorAll("a[download][href]")];
+    for (const anchor of anchors) {
+      if (!visible(anchor) || anchor.hasAttribute("data-carrier-native-download")) continue;
+      for (let candidate = anchor.parentElement; candidate; candidate = candidate.parentElement) {
+        if (!(candidate instanceof HTMLElement)) continue;
+        if (candidate.matches(DIALOG)) break;
+        if (!fillsViewport(candidate)) continue;
+        if (isSafeViewerRoot(candidate)) return candidate;
+      }
+    }
+    return null;
+  }
+  function isBulkMediaViewer(root) {
+    return isSafeViewerRoot(root);
+  }
+  function isBulkMediaViewerOwner(root, element2) {
+    return owns(root, element2);
   }
 
-  // inject/src/messenger/features/composer-keys.ts
-  var isMac = /mac/i.test(navigator.platform) || /mac/i.test(navigator.userAgent);
-  var composerSelector = '[contenteditable="true"][role="textbox"], [contenteditable="true"][data-lexical-editor="true"], textarea';
-  function isComposerTarget(target) {
-    if (!(target instanceof Element)) return false;
-    const editor = target.closest(composerSelector);
-    return !!editor?.closest('[role="main"]');
+  // inject/src/messenger/lib/bulk-media.ts
+  function findBulkMediaSource(dialog) {
+    const own = (element2) => isBulkMediaViewerOwner(dialog, element2);
+    const visible2 = (element2) => {
+      if (!own(element2) || element2.closest('[hidden], [aria-hidden="true"], [inert]')) return false;
+      const rect = element2.getBoundingClientRect();
+      const style = getComputedStyle(element2);
+      return rect.width > 0 && rect.height > 0 && style.visibility === "visible";
+    };
+    const usable = (value, allowBlob = false) => {
+      if (!value || value.startsWith("data:") || !allowBlob && value.startsWith("blob:"))
+        return false;
+      try {
+        const url = new URL(value, location.href);
+        return url.protocol === "https:" || url.protocol === "http:" || allowBlob && url.protocol === "blob:";
+      } catch {
+        return false;
+      }
+    };
+    const downloads = [...dialog.querySelectorAll("a[download][href]")].filter((anchor) => visible2(anchor) && usable(anchor.href, true)).sort((a, b) => Number(isThumbnailUrl(a.href)) - Number(isThumbnailUrl(b.href)));
+    const download = downloads[0];
+    if (download) {
+      const src = download.href;
+      return { key: mediaKey(src), src, fallbackName: download.download || "media" };
+    }
+    const video = [...dialog.querySelectorAll("video")].find(visible2);
+    if (video) {
+      const src = video.currentSrc || video.src || video.querySelector("source[src]")?.src || "";
+      if (usable(src)) return { key: mediaKey(src), src, fallbackName: "video" };
+      return null;
+    }
+    const image = [...dialog.querySelectorAll("img")].filter((element2) => visible2(element2) && fillsViewer(dialog, element2)).sort(
+      (a, b) => b.getBoundingClientRect().width * b.getBoundingClientRect().height - a.getBoundingClientRect().width * a.getBoundingClientRect().height
+    )[0];
+    if (image) {
+      const src = preferredImageSource(image);
+      if (usable(src)) return { key: mediaKey(src), src, fallbackName: "image" };
+    }
+    return null;
   }
-  function initComposerKeys() {
-    let compositionActive = false;
-    document.addEventListener(
-      "compositionstart",
-      (event) => {
-        if (isComposerTarget(event.target)) compositionActive = true;
-      },
-      true
+  function isThumbnailUrl(value) {
+    return /(?:thumb(?:nail)?|p\d+x\d+|s\d+x\d+|stp=|_s\.)/iu.test(value);
+  }
+  function preferredImageSource(image) {
+    const candidates = image.srcset.split(",").map((candidate) => {
+      const [src = "", descriptor = ""] = candidate.trim().split(/\s+/u);
+      const amount = Number.parseFloat(descriptor);
+      const score = descriptor.endsWith("w") ? amount : descriptor.endsWith("x") ? amount * image.naturalWidth : 0;
+      return { src, score, thumbnail: isThumbnailUrl(src) };
+    }).filter((candidate) => candidate.src);
+    candidates.sort((a, b) => Number(a.thumbnail) - Number(b.thumbnail) || b.score - a.score);
+    return candidates[0]?.src || image.currentSrc || image.src || "";
+  }
+  function fillsViewer(dialog, element2) {
+    const bounds = element2.getBoundingClientRect();
+    const viewer = dialog.getBoundingClientRect();
+    const width = Math.max(
+      0,
+      Math.min(bounds.right, viewer.right, innerWidth) - Math.max(bounds.left, viewer.left, 0)
     );
-    document.addEventListener(
-      "compositionend",
-      () => {
-        compositionActive = false;
-      },
-      true
+    const height = Math.max(
+      0,
+      Math.min(bounds.bottom, viewer.bottom, innerHeight) - Math.max(bounds.top, viewer.top, 0)
     );
-    document.addEventListener(
-      "keydown",
-      (event) => {
-        if (!isComposerTarget(event.target)) return;
-        if (!shouldKeepEnterInComposer({
-          key: event.key,
-          isComposing: event.isComposing,
-          compositionActive,
-          keyCode: event.keyCode,
-          requireAccelerator: window.__CARRIER_SETTINGS__?.send_with_accelerator === true,
-          acceleratorPressed: isMac ? event.metaKey : event.ctrlKey,
-          shiftKey: event.shiftKey
-        }))
-          return;
-        event.stopImmediatePropagation();
-      },
-      true
-    );
+    const denominatorWidth = Math.min(viewer.width, innerWidth);
+    const denominatorHeight = Math.min(viewer.height, innerHeight);
+    const widthRatio = width / denominatorWidth;
+    const heightRatio = height / denominatorHeight;
+    return denominatorWidth > 0 && denominatorHeight > 0 && (widthRatio >= 0.15 && heightRatio >= 0.15 || widthRatio >= 0.5 || heightRatio >= 0.5);
+  }
+  function mediaKey(src) {
+    try {
+      const url = new URL(src, location.href);
+      const facebookCdn = url.hostname === "fbcdn.net" || url.hostname.endsWith(".fbcdn.net") || url.hostname === "fbsbx.com" || url.hostname.endsWith(".fbsbx.com");
+      if (facebookCdn) {
+        for (const parameter of [
+          "oh",
+          "oe",
+          "ccb",
+          "efg",
+          "stp",
+          "dl",
+          "bytestart",
+          "byteend",
+          "__nc_sid",
+          "__nc_ohc",
+          "__nc_gid",
+          "__nc_cat",
+          "rm"
+        ]) {
+          url.searchParams.delete(parameter);
+        }
+      }
+      url.hash = "";
+      return url.href;
+    } catch {
+      return src;
+    }
+  }
+  var normalizeLabel = (value) => value.toLocaleLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "").trim();
+  function findMediaNavigation(dialog, direction) {
+    const phrases = direction === "older" ? ["previous", "prev", "precedent", "precedente"] : ["next", "suivant", "suivante"];
+    for (const control of dialog.querySelectorAll('button, [role="button"], a[href]')) {
+      if (!isBulkMediaViewerOwner(dialog, control)) continue;
+      if (control.closest("[data-carrier-bulk-media]")) continue;
+      if (control.closest('[hidden], [aria-hidden="true"], [inert]')) continue;
+      const rect = control.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0 || getComputedStyle(control).visibility !== "visible")
+        continue;
+      const label2 = normalizeLabel(
+        [
+          control.getAttribute("aria-label") || "",
+          control.getAttribute("title") || "",
+          control.textContent || ""
+        ].join(" ")
+      );
+      if (phrases.some((phrase) => new RegExp(`(?:^|\\W)${phrase}(?:$|\\W)`, "u").test(label2)))
+        return control;
+    }
+    return null;
+  }
+  var BulkMediaQueue = class {
+    constructor(adapter, chatKey) {
+      __publicField(this, "adapter", adapter);
+      __publicField(this, "chatKey", chatKey);
+      __publicField(this, "snapshot", {
+        status: "idle",
+        direction: "older",
+        counts: { saved: 0, skipped: 0, failed: 0 },
+        reason: ""
+      });
+      __publicField(this, "listeners", /* @__PURE__ */ new Set());
+      __publicField(this, "pauseWaiter", null);
+      __publicField(this, "generation", 0);
+      __publicField(this, "running", false);
+    }
+    get state() {
+      return { ...this.snapshot, counts: { ...this.snapshot.counts } };
+    }
+    subscribe(listener) {
+      this.listeners.add(listener);
+      listener(this.state);
+      return () => this.listeners.delete(listener);
+    }
+    start(direction) {
+      if (this.snapshot.status === "paused") {
+        this.resume();
+        return;
+      }
+      if (this.running) return;
+      const generation = ++this.generation;
+      this.running = true;
+      this.snapshot = {
+        status: "running",
+        direction,
+        counts: { saved: 0, skipped: 0, failed: 0 },
+        reason: ""
+      };
+      this.emit();
+      void this.run(generation);
+    }
+    selectDirection(direction) {
+      if (this.snapshot.status === "running" || this.snapshot.status === "paused") return;
+      this.snapshot = { ...this.snapshot, direction };
+      this.emit();
+    }
+    pause() {
+      if (this.snapshot.status !== "running") return;
+      this.snapshot = { ...this.snapshot, status: "paused" };
+      this.emit();
+    }
+    cancel(reason) {
+      if (!this.running) {
+        this.setStatus("stopped", reason, this.generation);
+        return;
+      }
+      this.generation += 1;
+      this.snapshot = { ...this.snapshot, status: "stopping", reason };
+      this.pauseWaiter?.();
+      this.pauseWaiter = null;
+      this.emit();
+    }
+    resume() {
+      if (this.snapshot.status !== "paused") return;
+      this.snapshot = { ...this.snapshot, status: "running" };
+      this.emit();
+      this.pauseWaiter?.();
+      this.pauseWaiter = null;
+    }
+    reset() {
+      const wasRunning = this.running;
+      this.generation += 1;
+      this.snapshot = {
+        status: wasRunning ? "stopping" : "idle",
+        direction: this.snapshot.direction,
+        counts: { saved: 0, skipped: 0, failed: 0 },
+        reason: wasRunning ? "Reset requested. Waiting for the active native download to finish." : ""
+      };
+      this.pauseWaiter?.();
+      this.pauseWaiter = null;
+      this.emit();
+    }
+    emit() {
+      const state2 = this.state;
+      for (const listener of this.listeners) listener(state2);
+    }
+    setStatus(status, reason, generation) {
+      if (generation !== this.generation) return;
+      this.snapshot = { ...this.snapshot, status, reason };
+      this.emit();
+    }
+    async waitWhilePaused(generation) {
+      if (generation !== this.generation) return false;
+      if (this.snapshot.status !== "paused") return true;
+      await new Promise((resolve) => {
+        this.pauseWaiter = resolve;
+      });
+      return generation === this.generation;
+    }
+    async run(generation) {
+      const visited = /* @__PURE__ */ new Set();
+      const completed = completedMediaByChat.get(this.chatKey) || /* @__PURE__ */ new Set();
+      completedMediaByChat.set(this.chatKey, completed);
+      try {
+        while (generation === this.generation) {
+          if (!await this.waitWhilePaused(generation)) return;
+          if (!this.adapter.stillInChat()) {
+            this.setStatus(
+              "stopped",
+              "Stopped because the chat or media viewer changed.",
+              generation
+            );
+            return;
+          }
+          const item = this.adapter.current();
+          if (!item) {
+            this.setStatus(
+              "stopped",
+              "Stopped because this media has no supported full-size download source.",
+              generation
+            );
+            return;
+          }
+          if (visited.has(item.key)) {
+            this.setStatus(
+              "stopped",
+              "Stopped at repeated media to avoid a navigation loop.",
+              generation
+            );
+            return;
+          }
+          visited.add(item.key);
+          if (completed.has(item.key)) {
+            this.snapshot.counts.skipped += 1;
+            this.emit();
+          } else {
+            try {
+              await this.adapter.save(item);
+              completed.add(item.key);
+              if (generation !== this.generation) return;
+              this.snapshot.counts.saved += 1;
+            } catch {
+              if (generation !== this.generation) return;
+              this.snapshot.counts.failed += 1;
+            }
+            this.emit();
+          }
+          if (!await this.waitWhilePaused(generation)) return;
+          if (!this.adapter.stillInChat()) {
+            this.setStatus(
+              "stopped",
+              "Stopped because the chat or media viewer changed.",
+              generation
+            );
+            return;
+          }
+          const advanced = await this.adapter.advance(this.snapshot.direction, item.key);
+          if (generation !== this.generation) return;
+          if (!this.adapter.stillInChat()) {
+            this.setStatus(
+              "stopped",
+              "Stopped because the chat or media viewer changed.",
+              generation
+            );
+            return;
+          }
+          if (!advanced) {
+            this.setStatus(
+              "complete",
+              "Reached the end of available media in this direction.",
+              generation
+            );
+            return;
+          }
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "Media navigation failed.";
+        this.setStatus("stopped", reason, generation);
+      } finally {
+        this.running = false;
+        if (this.snapshot.status === "stopping") {
+          this.snapshot = { ...this.snapshot, status: "idle" };
+          this.emit();
+        }
+      }
+    }
+  };
+  var completedMediaByChat = /* @__PURE__ */ new Map();
+
+  // inject/src/messenger/lib/emoji-images.ts
+  var FACEBOOK_EMOJI_PATH = "/images/emoji.php/";
+  var isFacebookEmojiImage = (value) => typeof value === "string" && value.includes(FACEBOOK_EMOJI_PATH);
+  function hasImageArea(rect) {
+    return rect.right > rect.left && rect.bottom > rect.top;
+  }
+  function intersectsImageClip(rect, clip) {
+    return !(rect.bottom < clip.top || rect.top > clip.bottom || rect.right < clip.left || rect.left > clip.right);
+  }
+  function intersectImageClips(left, right) {
+    return {
+      top: Math.max(left.top, right.top),
+      right: Math.min(left.right, right.right),
+      bottom: Math.min(left.bottom, right.bottom),
+      left: Math.max(left.left, right.left)
+    };
+  }
+  function expandedImageClip(rect, margin) {
+    return {
+      top: rect.top - margin,
+      right: rect.right + margin,
+      bottom: rect.bottom + margin,
+      left: rect.left - margin
+    };
+  }
+
+  // inject/src/messenger/lib/media-viewer.ts
+  var MEDIA_VIEWER_ATTR = "data-carrier-media-viewer";
+  var DIALOG2 = '[role="dialog"]';
+  var HIDDEN2 = '[hidden], [aria-hidden="true"], [inert]';
+  function isMediaViewerShape(shape) {
+    if (shape.excluded || !shape.overlay || !shape.hasMedia) return false;
+    if (!shape.hasDownload && !shape.hasVideoControls) return false;
+    return coversViewport(shape.rect, shape.viewport);
+  }
+  function coversViewport(rect, viewport) {
+    const visible2 = intersectImageClips(rect, viewport);
+    const width = viewport.right - viewport.left;
+    const height = viewport.bottom - viewport.top;
+    return width > 0 && height > 0 && visible2.right - visible2.left >= width * 0.75 && visible2.bottom - visible2.top >= height * 0.7;
+  }
+  function isVisible(element2) {
+    if (element2.closest(HIDDEN2)) return false;
+    const style = getComputedStyle(element2);
+    const rect = element2.getBoundingClientRect();
+    return style.visibility === "visible" && rect.width > 0 && rect.height > 0;
+  }
+  function isMediaViewerDialog(dialog) {
+    if (!isVisible(dialog)) return false;
+    const viewport = { left: 0, top: 0, right: innerWidth, bottom: innerHeight };
+    const rect = dialog.getBoundingClientRect();
+    if (!coversViewport(rect, viewport)) return false;
+    let overlay = dialog.getAttribute("aria-modal") === "true";
+    let excluded = !!dialog.closest("[data-carrier-shortcuts-overlay]");
+    for (let ancestor = dialog; ancestor; ancestor = ancestor.parentElement) {
+      const position = getComputedStyle(ancestor).position;
+      if (position === "fixed" || position === "absolute") overlay = true;
+    }
+    const owns2 = (element2) => element2.closest(DIALOG2) === dialog;
+    excluded || (excluded = [...dialog.querySelectorAll('[role="navigation"], [contenteditable="true"]')].some(
+      owns2
+    ));
+    if (excluded || !overlay) return false;
+    const media = [
+      ...dialog.querySelectorAll("img, video")
+    ].filter((element2) => {
+      if (!owns2(element2) || !isVisible(element2)) return false;
+      const bounds = element2.getBoundingClientRect();
+      const visible2 = intersectImageClips(intersectImageClips(bounds, rect), viewport);
+      const width = (visible2.right - visible2.left) / Math.min(rect.width, viewport.right);
+      const height = (visible2.bottom - visible2.top) / Math.min(rect.height, viewport.bottom);
+      return width > 0 && height > 0 && (width >= 0.15 && height >= 0.15 || width >= 0.5 || height >= 0.5);
+    });
+    return isMediaViewerShape({
+      rect,
+      viewport,
+      overlay,
+      excluded,
+      hasMedia: media.length > 0,
+      hasDownload: [...dialog.querySelectorAll("a[download]")].some(
+        (element2) => owns2(element2) && isVisible(element2)
+      ),
+      hasVideoControls: media.some(
+        (element2) => element2 instanceof HTMLVideoElement && element2.controls
+      )
+    });
   }
 
   // inject/src/messenger/lib/download-completion.ts
@@ -2656,7 +3111,7 @@ ${button.innerHTML}`)
     x: nativeReflectApply3(nativeGetMouseClientX, event, []),
     y: nativeReflectApply3(nativeGetMouseClientY, event, [])
   });
-  var isMac2 = /mac/i.test(navigator.platform) || /mac/i.test(navigator.userAgent);
+  var isMac = /mac/i.test(navigator.platform) || /mac/i.test(navigator.userAgent);
   function contextActionToken() {
     const bytes = new NativeUint8Array(16);
     nativeGetRandomValues(bytes);
@@ -2695,7 +3150,7 @@ ${button.innerHTML}`)
       if (!item) continue;
       const action2 = contextActionToken();
       const run = () => {
-        item[1](isMac2 ? action2 : void 0);
+        item[1](isMac ? action2 : void 0);
       };
       appendOwn(nativeActionHandlers, [action2, run]);
       appendOwn(
@@ -2838,7 +3293,7 @@ ${button.innerHTML}`)
             IMAGE_CONTEXT_MENU_LABELS[1],
             () => downloadSrc(imgSrc, "image").then(({ url }) => toastDownloadSaved(url)).catch((error) => toastDownloadFailure(error))
           ]);
-          if (isMac2) {
+          if (isMac) {
             addItem([
               IMAGE_CONTEXT_MENU_LABELS[2],
               (action2) => action2 ? shareSrc(imgSrc, "image", fx, fy, action2).catch(
@@ -2853,7 +3308,7 @@ ${button.innerHTML}`)
             VIDEO_CONTEXT_MENU_LABELS[0],
             () => downloadSrc(vidSrc, "video").then(({ url }) => toastDownloadSaved(url)).catch((error) => toastDownloadFailure(error))
           ]);
-          if (isMac2) {
+          if (isMac) {
             addItem([
               VIDEO_CONTEXT_MENU_LABELS[1],
               (action2) => action2 ? shareSrc(vidSrc, "video", fx, fy, action2).catch(
@@ -2880,7 +3335,7 @@ ${button.innerHTML}`)
           }
         }
         nativeReflectApply3(nativePreventDefault, e, []);
-        const nativeImageCopyIsSafe = isMac2 || !imgSrc;
+        const nativeImageCopyIsSafe = isMac || !imgSrc;
         if (nativeShowContextMenu && nativeItemsAreValid && nativeImageCopyIsSafe) {
           try {
             await showNativeContextMenu(items);
@@ -2929,7 +3384,7 @@ ${button.innerHTML}`)
           const item = items[index];
           if (!item) continue;
           const label2 = item[0];
-          if (isMac2 && (label2 === IMAGE_CONTEXT_MENU_LABELS[2] || label2 === VIDEO_CONTEXT_MENU_LABELS[1])) {
+          if (isMac && (label2 === IMAGE_CONTEXT_MENU_LABELS[2] || label2 === VIDEO_CONTEXT_MENU_LABELS[1])) {
             continue;
           }
           const fn = item[1];
@@ -3054,6 +3509,257 @@ ${button.innerHTML}`)
     ]);
   }
 
+  // inject/src/messenger/features/bulk-media.ts
+  var HOST_ATTR = "data-carrier-bulk-media";
+  var VIEWER = '[role="dialog"]';
+  var NAVIGATION_TIMEOUT_MS = 1e4;
+  function initBulkMedia() {
+    let activeDialog = null;
+    let host = null;
+    let root = null;
+    let queue = null;
+    let stopListening = null;
+    let activeChatKey = "";
+    const chatKey = () => location.pathname.match(/\/messages(?:\/e2ee)?\/t\/[^/]+/u)?.[0] || location.pathname;
+    const isViewer = (element2) => element2.matches(VIEWER) && isMediaViewerDialog(element2) || isBulkMediaViewer(element2);
+    const findViewer = () => {
+      const dialog = [...document.querySelectorAll(VIEWER)].find(isMediaViewerDialog);
+      return dialog || findRolelessMediaViewer();
+    };
+    const refresh = () => {
+      const next = activeDialog?.isConnected && isViewer(activeDialog) ? activeDialog : findViewer();
+      const nextChatKey = chatKey();
+      if (next === activeDialog && activeChatKey === nextChatKey && host) return;
+      queue?.cancel("Stopped because the chat or media viewer changed.");
+      activeDialog = next;
+      stopListening?.();
+      stopListening = null;
+      queue = null;
+      if (!next) {
+        host?.remove();
+        host = null;
+        root = null;
+        activeChatKey = nextChatKey;
+        return;
+      }
+      if (!host) {
+        host = document.createElement("div");
+        host.setAttribute(HOST_ATTR, "");
+        root = host.attachShadow({ mode: "open" });
+      }
+      host.setAttribute("data-open", "");
+      if (!host.isConnected) document.body.appendChild(host);
+      activeChatKey = nextChatKey;
+      const queuedDialog = next;
+      const queuedChatKey = nextChatKey;
+      const stillInQueue = () => !!queuedDialog.isConnected && activeDialog === queuedDialog && isViewer(queuedDialog) && chatKey() === queuedChatKey;
+      queue = new BulkMediaQueue(
+        {
+          current: () => isViewer(queuedDialog) ? findBulkMediaSource(queuedDialog) : null,
+          save: async (item) => {
+            await downloadSrc(item.src, item.fallbackName);
+          },
+          advance: async (direction, previousKey) => {
+            if (!stillInQueue()) return false;
+            const button = findMediaNavigation(queuedDialog, direction);
+            if (!button)
+              throw new Error(
+                "Stopped because Messenger exposes no recognized Previous/Next control in this viewer."
+              );
+            if (button.matches(":disabled") || button.getAttribute("aria-disabled") === "true")
+              return false;
+            button.click();
+            const deadline = Date.now() + NAVIGATION_TIMEOUT_MS;
+            let stableKey = "";
+            let stableCount = 0;
+            while (Date.now() < deadline) {
+              await new Promise((resolve) => window.setTimeout(resolve, 120));
+              if (!stillInQueue()) return false;
+              const nextItem = findBulkMediaSource(queuedDialog);
+              if (nextItem?.key && nextItem.key !== previousKey) {
+                if (stableKey === nextItem.key) stableCount += 1;
+                else {
+                  stableKey = nextItem.key;
+                  stableCount = 1;
+                }
+                if (stableCount >= 2) return true;
+              } else {
+                stableKey = "";
+                stableCount = 0;
+              }
+            }
+            throw new Error("Stopped because the next media did not load within 10 seconds.");
+          },
+          stillInChat: stillInQueue
+        },
+        queuedChatKey
+      );
+      stopListening = queue.subscribe(render);
+      render(queue.state);
+    };
+    function render(state2) {
+      if (!root) return;
+      root.innerHTML = `<style>
+      :host{all:initial;position:fixed;z-index:2147483646;left:18px;top:18px;color-scheme:light dark;font:14px/1.4 system-ui,-apple-system,sans-serif}
+      *{box-sizing:border-box}button{font:inherit;color:inherit;cursor:pointer}
+      .wrap{position:relative}.open{border:0;border-radius:999px;padding:10px 16px;background:#1877f2;color:white;box-shadow:0 2px 12px #0005;font-weight:650}
+      .panel{display:none;position:absolute;left:0;top:48px;width:300px;padding:14px;border-radius:12px;background:#fff;color:#1c1e21;box-shadow:0 6px 28px #0005}
+      :host([data-open]) .panel{display:block}h2{font-size:16px;margin:0 0 8px}.directions,.actions{display:flex;gap:8px;margin:10px 0}
+      .directions button,.actions button{border:1px solid #ccd0d5;border-radius:8px;padding:7px 10px;background:#f5f6f7}
+      button[aria-pressed=true]{border-color:#1877f2;background:#e7f3ff;color:#0866ff}.actions .primary{background:#1877f2;color:white;border-color:#1877f2}
+      .counts{margin:8px 0;color:#444}.reason{margin:8px 0 0;color:#555;overflow-wrap:anywhere}.hint{color:#555;font-size:13px;margin:8px 0 0}
+      @media(prefers-color-scheme:dark){.panel{background:#242526;color:#e4e6eb}.directions button,.actions button{background:#3a3b3c;border-color:#555;color:#e4e6eb}.counts,.reason,.hint{color:#c9cdd2}}
+    </style><div class="wrap"><button type="button" class="open" aria-expanded="true">Batch download</button><section class="panel" aria-label="Batch download"><h2>Download chat media</h2>
+      <div class="directions"><button type="button" data-direction="older" aria-pressed="${state2.direction === "older"}">← Previous</button><button type="button" data-direction="newer" aria-pressed="${state2.direction === "newer"}">Next →</button></div>
+      <div class="actions"><button type="button" class="primary" data-action="start">Start</button><button type="button" data-action="pause">Pause</button><button type="button" data-action="resume">Resume</button><button type="button" data-action="reset">Reset</button></div>
+      <p class="counts">Saved ${state2.counts.saved} · Skipped ${state2.counts.skipped} · Failed ${state2.counts.failed}</p>
+      <p class="reason">${escapeHtml(state2.reason)}</p>
+      ${window.__CARRIER_SETTINGS__?.download_behavior === "ask" ? '<p class="hint">Bulk downloads need automatic saving. In Carrier Settings, choose “Downloads folder” and reopen this viewer.</p>' : '<p class="hint">Starts from the item open now and follows the selected direction. Photos and videos only.</p>'}
+    </section></div>`;
+      const open = root.querySelector(".open");
+      open.setAttribute("aria-expanded", String(host?.hasAttribute("data-open") || false));
+      if (host) {
+        host.dataset.status = state2.status;
+        host.dataset.saved = String(state2.counts.saved);
+        host.dataset.skipped = String(state2.counts.skipped);
+        host.dataset.failed = String(state2.counts.failed);
+      }
+      open.addEventListener("click", () => {
+        if (!host) return;
+        host.toggleAttribute("data-open");
+        open.setAttribute("aria-expanded", String(host.hasAttribute("data-open")));
+      });
+      root.querySelectorAll("[data-direction]").forEach((button) => {
+        button.addEventListener("click", () => {
+          if (!queue) return;
+          queue.selectDirection(button.dataset.direction);
+        });
+      });
+      root.querySelector('[data-action="start"]').addEventListener("click", () => {
+        if (window.__CARRIER_SETTINGS__?.download_behavior === "ask") return;
+        queue?.start(state2.direction);
+      });
+      root.querySelector('[data-action="pause"]').addEventListener("click", () => queue?.pause());
+      root.querySelector('[data-action="resume"]').addEventListener("click", () => queue?.resume());
+      root.querySelector('[data-action="reset"]').addEventListener("click", () => queue?.reset());
+      root.querySelectorAll('[data-action="start"]').forEach((button) => {
+        if (window.__CARRIER_SETTINGS__?.download_behavior === "ask" || state2.status === "stopping")
+          button.disabled = true;
+      });
+      root.querySelectorAll("[data-direction]").forEach((button) => {
+        button.disabled = state2.status === "running" || state2.status === "paused" || state2.status === "stopping";
+      });
+      root.querySelector('[data-action="pause"]').disabled = state2.status !== "running";
+      root.querySelector('[data-action="resume"]').disabled = state2.status !== "paused";
+    }
+    function escapeHtml(value) {
+      return value.replace(
+        /[&<>"']/g,
+        (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]
+      );
+    }
+    let frame = 0;
+    const schedule = () => {
+      if (!frame)
+        frame = requestAnimationFrame(() => {
+          frame = 0;
+          refresh();
+        });
+    };
+    const observer = new MutationObserver((records) => {
+      const relevant = records.some((record2) => {
+        if (record2.target instanceof Element && (activeDialog?.contains(record2.target) || record2.target.matches("a[download]")))
+          return true;
+        return record2.type === "childList" && [...record2.addedNodes, ...record2.removedNodes].some(
+          (node) => node instanceof Element && (node.matches(VIEWER) || node.matches("a[download]") || !!node.querySelector(`${VIEWER}, a[download]`) || !!activeDialog && node.contains(activeDialog))
+        );
+      });
+      if (relevant) schedule();
+    });
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: [
+        "hidden",
+        "aria-hidden",
+        "inert",
+        "role",
+        "aria-modal",
+        "class",
+        "style",
+        "download",
+        "controls"
+      ]
+    });
+    const mediaLoaded = (event) => {
+      if (!(event.target instanceof Element)) return;
+      if (activeDialog?.contains(event.target)) {
+        schedule();
+        return;
+      }
+      if (!activeDialog && event.target.matches("img, video") && document.querySelector("a[download]"))
+        schedule();
+    };
+    document.addEventListener("load", mediaLoaded, true);
+    document.addEventListener("loadedmetadata", mediaLoaded, true);
+    document.addEventListener("error", mediaLoaded, true);
+    window.addEventListener("resize", schedule, { passive: true });
+    window.addEventListener("popstate", schedule);
+    schedule();
+  }
+
+  // inject/src/messenger/lib/composer-keys.ts
+  function shouldKeepEnterInComposer(state2) {
+    if (state2.key !== "Enter") return false;
+    if (state2.isComposing || state2.compositionActive || state2.keyCode === 229) return true;
+    return state2.requireAccelerator && !state2.acceleratorPressed && !state2.shiftKey;
+  }
+
+  // inject/src/messenger/features/composer-keys.ts
+  var isMac2 = /mac/i.test(navigator.platform) || /mac/i.test(navigator.userAgent);
+  var composerSelector = '[contenteditable="true"][role="textbox"], [contenteditable="true"][data-lexical-editor="true"], textarea';
+  function isComposerTarget(target) {
+    if (!(target instanceof Element)) return false;
+    const editor = target.closest(composerSelector);
+    return !!editor?.closest('[role="main"]');
+  }
+  function initComposerKeys() {
+    let compositionActive = false;
+    document.addEventListener(
+      "compositionstart",
+      (event) => {
+        if (isComposerTarget(event.target)) compositionActive = true;
+      },
+      true
+    );
+    document.addEventListener(
+      "compositionend",
+      () => {
+        compositionActive = false;
+      },
+      true
+    );
+    document.addEventListener(
+      "keydown",
+      (event) => {
+        if (!isComposerTarget(event.target)) return;
+        if (!shouldKeepEnterInComposer({
+          key: event.key,
+          isComposing: event.isComposing,
+          compositionActive,
+          keyCode: event.keyCode,
+          requireAccelerator: window.__CARRIER_SETTINGS__?.send_with_accelerator === true,
+          acceleratorPressed: isMac2 ? event.metaKey : event.ctrlKey,
+          shiftKey: event.shiftKey
+        }))
+          return;
+        event.stopImmediatePropagation();
+      },
+      true
+    );
+  }
+
   // inject/src/messenger/lib/color.ts
   var rgb = (color) => {
     const m = color?.match(/rgba?\(([^)]+)\)/);
@@ -3129,7 +3835,7 @@ ${button.innerHTML}`)
     const buttons = [];
     if (root.matches?.(selector)) buttons.push(root);
     buttons.push(...root.querySelectorAll?.(selector) || []);
-    const visible = buttons.filter((button) => {
+    const visible2 = buttons.filter((button) => {
       if (button.closest('[aria-hidden="true"]')) return false;
       const r = visibleBox(button);
       if (!r || r.width < 90 || r.height < 28) return false;
@@ -3141,8 +3847,8 @@ ${button.innerHTML}`)
       if (!hit || !button.contains(hit)) return false;
       return true;
     });
-    return visible.filter(
-      (button) => !visible.some((other) => other !== button && button.contains(other))
+    return visible2.filter(
+      (button) => !visible2.some((other) => other !== button && button.contains(other))
     );
   };
   var bottomActionRow = (root) => {
@@ -3334,32 +4040,6 @@ ${button.innerHTML}`)
       },
       true
     );
-  }
-
-  // inject/src/messenger/lib/emoji-images.ts
-  var FACEBOOK_EMOJI_PATH = "/images/emoji.php/";
-  var isFacebookEmojiImage = (value) => typeof value === "string" && value.includes(FACEBOOK_EMOJI_PATH);
-  function hasImageArea(rect) {
-    return rect.right > rect.left && rect.bottom > rect.top;
-  }
-  function intersectsImageClip(rect, clip) {
-    return !(rect.bottom < clip.top || rect.top > clip.bottom || rect.right < clip.left || rect.left > clip.right);
-  }
-  function intersectImageClips(left, right) {
-    return {
-      top: Math.max(left.top, right.top),
-      right: Math.min(left.right, right.right),
-      bottom: Math.min(left.bottom, right.bottom),
-      left: Math.max(left.left, right.left)
-    };
-  }
-  function expandedImageClip(rect, margin) {
-    return {
-      top: rect.top - margin,
-      right: rect.right + margin,
-      bottom: rect.bottom + margin,
-      left: rect.left - margin
-    };
   }
 
   // inject/src/messenger/features/emoji-images.ts
@@ -4736,7 +5416,7 @@ ${button.innerHTML}`)
       const scale = Math.min(2, Math.max(0.3, configuredZoom / 100));
       return new DOMRect(rect.x / scale, rect.y / scale, rect.width / scale, rect.height / scale);
     }
-    function visible(el) {
+    function visible2(el) {
       const r = el ? normalizedRect(el) : null;
       if (!r || r.width <= 0 || r.height <= 0) return false;
       const cs = getComputedStyle(el);
@@ -4753,7 +5433,7 @@ ${button.innerHTML}`)
     function textLeaves(root) {
       const out = [];
       root.querySelectorAll?.(TEXT_SURFACE_SEL).forEach((el) => {
-        if (!visible(el) || el.closest?.('[contenteditable="true"]')) return;
+        if (!visible2(el) || el.closest?.('[contenteditable="true"]')) return;
         if (!textValue(el)) return;
         for (const child of el.children || []) {
           if (textValue(child)) return;
@@ -4769,7 +5449,7 @@ ${button.innerHTML}`)
     function textSurfaces(root) {
       const out = [];
       root.querySelectorAll?.(TEXT_SURFACE_SEL).forEach((el) => {
-        if (!visible(el) || el.closest?.('[contenteditable="true"]')) return;
+        if (!visible2(el) || el.closest?.('[contenteditable="true"]')) return;
         if (!textValue(el)) return;
         out.push(el);
       });
@@ -4821,11 +5501,11 @@ ${button.innerHTML}`)
       const seen = /* @__PURE__ */ new Set();
       for (const row of document.querySelectorAll(THREAD_ROW_SEL)) {
         const href = row.getAttribute("href") || "";
-        if (!href || seen.has(href) || !visible(row)) continue;
+        if (!href || seen.has(href) || !visible2(row)) continue;
         seen.add(href);
         const rr = normalizedRect(row);
         row.querySelectorAll(VISUAL_SEL).forEach((el) => {
-          if (!visible(el)) return;
+          if (!visible2(el)) return;
           const r = normalizedRect(el);
           const leftAvatar = r.left < rr.left + 80 && r.width >= 20 && r.height >= 20;
           const rightReceipt = r.right > rr.right - 56 && r.width >= 12 && r.width <= 34 && r.height >= 12 && r.height <= 34;
@@ -4860,7 +5540,7 @@ ${button.innerHTML}`)
         if (r.top >= mr.top && r.bottom <= headerBottom && r.left < actionStart) mark(el);
       });
       main2.querySelectorAll(VISUAL_SEL).forEach((el) => {
-        if (!visible(el)) return;
+        if (!visible2(el)) return;
         const r = normalizedRect(el);
         if (r.top >= mr.top && r.bottom <= headerBottom && r.left < actionStart && r.width >= 20 && r.height >= 20) {
           mark(el);
@@ -4870,12 +5550,12 @@ ${button.innerHTML}`)
     function markThreadMessages(main2) {
       main2.querySelectorAll('[role="article"]').forEach((article) => {
         article.querySelectorAll("h3, h3 *").forEach((el) => {
-          if (visible(el) && textValue(el)) mark(el);
+          if (visible2(el) && textValue(el)) mark(el);
         });
         article.querySelectorAll(
           'img[referrerpolicy="origin-when-cross-origin"], img[height="14"][width="14"][tabindex="-1"]'
         ).forEach((el) => {
-          if (visible(el)) mark(el);
+          if (visible2(el)) mark(el);
         });
         textLeaves(article).forEach((el) => {
           if (/\breplied to\b/i.test(textValue(el))) mark(el);
@@ -8848,14 +9528,14 @@ ${button.innerHTML}`)
     lastReportedAt: null
   });
   var THREAD_VIEW_RECHECK_MS = 5e3;
-  function advanceThreadViewed(previous, threadPath, visible, now) {
-    const active = visible && threadPath !== null;
+  function advanceThreadViewed(previous, threadPath, visible2, now) {
+    const active = visible2 && threadPath !== null;
     const changed = !previous.visible || previous.threadPath !== threadPath;
     const recheckDue = active && previous.lastReportedAt !== null && Number.isFinite(now) && now >= previous.lastReportedAt + THREAD_VIEW_RECHECK_MS;
     const emit = active && (changed || recheckDue) ? threadPath : null;
     return {
       state: {
-        visible,
+        visible: visible2,
         threadPath,
         lastReportedAt: emit ? now : active ? previous.lastReportedAt : null
       },
@@ -11538,68 +12218,6 @@ ${text}`)) {
     setTimeout(() => apply(true), 4e3);
   }
 
-  // inject/src/messenger/lib/media-viewer.ts
-  var MEDIA_VIEWER_ATTR = "data-carrier-media-viewer";
-  var DIALOG = '[role="dialog"]';
-  var HIDDEN = '[hidden], [aria-hidden="true"], [inert]';
-  function isMediaViewerShape(shape) {
-    if (shape.excluded || !shape.overlay || !shape.hasMedia) return false;
-    if (!shape.hasDownload && !shape.hasVideoControls) return false;
-    return coversViewport(shape.rect, shape.viewport);
-  }
-  function coversViewport(rect, viewport) {
-    const visible = intersectImageClips(rect, viewport);
-    const width = viewport.right - viewport.left;
-    const height = viewport.bottom - viewport.top;
-    return width > 0 && height > 0 && visible.right - visible.left >= width * 0.75 && visible.bottom - visible.top >= height * 0.7;
-  }
-  function isVisible(element2) {
-    if (element2.closest(HIDDEN)) return false;
-    const style = getComputedStyle(element2);
-    const rect = element2.getBoundingClientRect();
-    return style.visibility === "visible" && rect.width > 0 && rect.height > 0;
-  }
-  function isMediaViewerDialog(dialog) {
-    if (!isVisible(dialog)) return false;
-    const viewport = { left: 0, top: 0, right: innerWidth, bottom: innerHeight };
-    const rect = dialog.getBoundingClientRect();
-    if (!coversViewport(rect, viewport)) return false;
-    let overlay = dialog.getAttribute("aria-modal") === "true";
-    let excluded = !!dialog.closest("[data-carrier-shortcuts-overlay]");
-    for (let ancestor = dialog; ancestor; ancestor = ancestor.parentElement) {
-      const position = getComputedStyle(ancestor).position;
-      if (position === "fixed" || position === "absolute") overlay = true;
-    }
-    const owns = (element2) => element2.closest(DIALOG) === dialog;
-    excluded || (excluded = [...dialog.querySelectorAll('[role="navigation"], [contenteditable="true"]')].some(
-      owns
-    ));
-    if (excluded || !overlay) return false;
-    const media = [
-      ...dialog.querySelectorAll("img, video")
-    ].filter((element2) => {
-      if (!owns(element2) || !isVisible(element2)) return false;
-      const bounds = element2.getBoundingClientRect();
-      const visible = intersectImageClips(intersectImageClips(bounds, rect), viewport);
-      const width = (visible.right - visible.left) / Math.min(rect.width, viewport.right);
-      const height = (visible.bottom - visible.top) / Math.min(rect.height, viewport.bottom);
-      return width > 0 && height > 0 && (width >= 0.15 && height >= 0.15 || width >= 0.5 || height >= 0.5);
-    });
-    return isMediaViewerShape({
-      rect,
-      viewport,
-      overlay,
-      excluded,
-      hasMedia: media.length > 0,
-      hasDownload: [...dialog.querySelectorAll("a[download]")].some(
-        (element2) => owns(element2) && isVisible(element2)
-      ),
-      hasVideoControls: media.some(
-        (element2) => element2 instanceof HTMLVideoElement && element2.controls
-      )
-    });
-  }
-
   // inject/src/messenger/lib/viewer-controls.ts
   var SAFE_TOP = 8;
   var MAX_OFFSET = 64;
@@ -11610,7 +12228,7 @@ ${text}`)) {
   }
 
   // inject/src/messenger/features/viewer-controls.ts
-  var DIALOG2 = '[role="dialog"]';
+  var DIALOG3 = '[role="dialog"]';
   var BANNER = 'div[role="banner"]';
   var CONTROL = 'a[href], button, [role="button"]';
   var BANNER_ATTR = "data-carrier-media-controls";
@@ -11647,7 +12265,7 @@ ${text}`)) {
     let observedDialogs = /* @__PURE__ */ new Set();
     const refresh = () => {
       frame = 0;
-      const dialogs = new Set(document.querySelectorAll(DIALOG2));
+      const dialogs = new Set(document.querySelectorAll(DIALOG3));
       for (const dialog of observedDialogs) {
         if (!dialogs.has(dialog)) resizeObserver.unobserve(dialog);
       }
@@ -11677,7 +12295,7 @@ ${text}`)) {
         }
         for (const dialog of viewers) {
           for (const download of dialog.querySelectorAll("a[download]")) {
-            if (download.closest(DIALOG2) !== dialog) continue;
+            if (download.closest(DIALOG3) !== dialog) continue;
             const group = actionGroupFor(download, dialog);
             if (applyOffset(
               group,
@@ -11700,11 +12318,11 @@ ${text}`)) {
       if (!frame) frame = requestAnimationFrame(refresh);
     };
     const resizeObserver = new ResizeObserver(schedule);
-    const affectsControls = (element2) => !!element2.closest(`${DIALOG2}, ${BANNER}`) || [...observedDialogs, ...markedControls].some((control) => element2.contains(control));
+    const affectsControls = (element2) => !!element2.closest(`${DIALOG3}, ${BANNER}`) || [...observedDialogs, ...markedControls].some((control) => element2.contains(control));
     new MutationObserver((records) => {
       if (records.some(
         (record2) => record2.target instanceof Element && affectsControls(record2.target) || record2.type === "childList" && [...record2.addedNodes, ...record2.removedNodes].some(
-          (node) => node instanceof Element && (affectsControls(node) || node.querySelector(`${DIALOG2}, ${BANNER}`))
+          (node) => node instanceof Element && (affectsControls(node) || node.querySelector(`${DIALOG3}, ${BANNER}`))
         )
       ))
         schedule();
@@ -11725,7 +12343,7 @@ ${text}`)) {
       ]
     });
     const mediaLoaded = (event) => {
-      if (event.target instanceof Element && event.target.closest(DIALOG2)) schedule();
+      if (event.target instanceof Element && event.target.closest(DIALOG3)) schedule();
     };
     document.addEventListener("load", mediaLoaded, true);
     document.addEventListener("loadedmetadata", mediaLoaded, true);
@@ -11782,6 +12400,7 @@ ${text}`)) {
     initFeature("cookie-consent", initCookieAutoDecline);
     initFeature("login-tidy", initLoginTidy);
     initFeature("media-viewer", initMediaViewer);
+    initFeature("bulk-media", initBulkMedia);
     initFeature("viewer-controls", initViewerControls);
     initFeature("fullscreen", initFullscreenPolyfill);
   }

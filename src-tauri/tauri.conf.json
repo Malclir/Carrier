@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Carrier",
+  "productName": "Carrier Media",
   "version": "2.0.3",
-  "identifier": "io.github.kristofferr.carrier",
+  "identifier": "local.carrier.media",
   "build": {
     "frontendDist": "../dist"
   },
@@ -23,7 +23,7 @@
       "rpm",
       "appimage"
     ],
-    "publisher": "kristofferR",
+    "publisher": "Carrier Media contributors",
     "category": "SocialNetworking",
     "shortDescription": "Distraction-free Messenger desktop client",
     "longDescription": "Carrier wraps the Facebook Messenger web app in a tiny native window and strips away the surrounding Facebook chrome \u2014 no Feed, no Reels, no Marketplace. Built with Tauri.",

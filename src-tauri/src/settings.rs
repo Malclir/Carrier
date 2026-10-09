@@ -217,7 +217,7 @@ impl Default for Settings {
             hide_on_focus_loss: false,
             hide_taskbar_icon: false,
             mute_notifications: false,
-            automatic_update_checks: true,
+            automatic_update_checks: false,
             notification_sound: true,
             hide_notification_preview: false,
             group_notifications_by_conversation: true,
@@ -332,7 +332,7 @@ pub(crate) enum ContextMenuActivation {
     },
 }
 
-const APP_IDENTIFIER: &str = "io.github.kristofferr.carrier";
+const APP_IDENTIFIER: &str = "local.carrier.media";
 // Orders concurrent settings writes: each call takes a monotonically increasing
 // ticket, and the publish step below refuses to overwrite a destination that a
 // higher-ticket (newer) snapshot has already reached.
@@ -845,8 +845,8 @@ mod tests {
         );
         assert!(!s.spellcheck, "spellcheck should default to false");
         assert!(
-            s.automatic_update_checks,
-            "automatic signed-update discovery should default to true"
+            !s.automatic_update_checks,
+            "local forks should not automatically check upstream releases"
         );
         assert!(
             !s.tray_notice_shown,
@@ -1036,11 +1036,10 @@ mod tests {
     }
 
     #[test]
-    fn settings_json_missing_automatic_update_checks_defaults_to_true() {
-        // Existing installs should gain safe discovery, while install remains
-        // behind the separate explicit confirmation path.
+    fn settings_json_missing_automatic_update_checks_defaults_to_false() {
+        // Local fork settings should not opt into upstream release discovery.
         let s: Settings = serde_json::from_str("{}").unwrap();
-        assert!(s.automatic_update_checks);
+        assert!(!s.automatic_update_checks);
     }
 
     #[test]

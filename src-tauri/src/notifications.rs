@@ -1557,10 +1557,10 @@ impl ReplyAckWaiters {
     }
 
     fn complete(&mut self, id: u64, attempt: u64, ok: bool) -> bool {
-        if !self
+        if self
             .waiters
             .get(&id)
-            .is_some_and(|(expected, _)| *expected == attempt)
+            .is_none_or(|(expected, _)| *expected != attempt)
         {
             return false;
         }
@@ -2528,9 +2528,9 @@ impl SyncAlertGate {
     }
 
     pub(crate) fn on_degraded(&mut self, source: SyncAlertSource, now: Instant) -> bool {
-        let allow = !self
+        let allow = self
             .last_degraded_at
-            .is_some_and(|at| now.duration_since(at) < SYNC_ALERT_MIN_GAP);
+            .is_none_or(|at| now.duration_since(at) >= SYNC_ALERT_MIN_GAP);
         if allow {
             self.last_degraded_at = Some(now);
             // A suppressed repeat must not clear the pairing of a notice

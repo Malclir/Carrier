@@ -2,23 +2,21 @@
 
 use std::path::PathBuf;
 
-pub(crate) const UPDATE_INSTRUCTIONS: &str = "This debug installation receives debug drafts through carrier-debug-update. Release updates are blocked. New debug builds install only while Carrier is quit.";
+pub(crate) const UPDATE_INSTRUCTIONS: &str = "This local Carrier Media fork is updated by rebuilding its source. Upstream release updates are blocked.";
 
 fn install_dir() -> Option<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME")?);
     Some(if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/CarrierDebug")
+        home.join("Library/Application Support/CarrierMediaDebug")
     } else {
-        home.join(".local/share/carrier-debug")
+        home.join(".local/share/carrier-media-debug")
     })
 }
 
 pub(crate) fn release_updates_allowed() -> Result<(), String> {
-    if cfg!(debug_assertions) {
-        Err(UPDATE_INSTRUCTIONS.into())
-    } else {
-        Ok(())
-    }
+    // Release installers of this fork must also keep the bulk-media feature;
+    // upstream Carrier releases do not include it.
+    Err(UPDATE_INSTRUCTIONS.into())
 }
 
 /// Runs before GTK/AppKit, threads, or single-instance handling. The probe is
@@ -40,7 +38,8 @@ pub(crate) fn startup() -> bool {
         return false;
     }
     if let Some(dir) = install_dir() {
-        if dir.join("debug-only").exists() && !cfg!(feature = "diagnostics") {
+        let requires_diagnostics = dir.join("debug-only").exists();
+        if requires_diagnostics && !cfg!(feature = "diagnostics") {
             eprintln!(
                 "Carrier: this machine requires a diagnostics debug build. Run carrier-debug-update."
             );
@@ -138,12 +137,12 @@ fn capture_native_output() -> std::io::Result<()> {
         std::env::var_os("HOME").ok_or_else(|| std::io::Error::other("HOME missing"))?,
     );
     let dir = if cfg!(target_os = "macos") {
-        home.join("Library/Logs/io.github.kristofferr.carrier")
+        home.join("Library/Logs/local.carrier.media")
     } else {
         PathBuf::from(
             std::env::var_os("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share").into()),
         )
-        .join("io.github.kristofferr.carrier/logs")
+        .join("local.carrier.media/logs")
     };
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("native-{}.log", std::process::id()));
@@ -237,7 +236,7 @@ fn capture_native_output() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn debug_build_cannot_use_the_release_updater() {
+    fn local_fork_cannot_use_the_upstream_release_updater() {
         assert!(super::release_updates_allowed().is_err());
     }
 }

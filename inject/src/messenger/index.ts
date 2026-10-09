@@ -12,6 +12,7 @@
  */
 import { diag } from "./bridge";
 import { initAutoRefresh } from "./features/auto-refresh";
+import { initBulkMedia } from "./features/bulk-media";
 import { initComposerKeys } from "./features/composer-keys";
 import { initContextMenu } from "./features/context-menu";
 import { initCookieAutoDecline } from "./features/cookie-consent";
@@ -97,6 +98,7 @@ function main() {
   initFeature("cookie-consent", initCookieAutoDecline);
   initFeature("login-tidy", initLoginTidy);
   initFeature("media-viewer", initMediaViewer);
+  initFeature("bulk-media", initBulkMedia);
   initFeature("viewer-controls", initViewerControls);
   initFeature("fullscreen", initFullscreenPolyfill);
 }
