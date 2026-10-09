@@ -160,24 +160,28 @@ describe("hand-maintained injected assets", () => {
     expect(buildScript).toContain('--sign "$IDENTITY"');
   });
 
-  test("the share extension build rejects multiline bundle versions", async () => {
-    const outputDir = await mkdtemp(join(tmpdir(), "carrier-share-version-"));
-    try {
-      const result = Bun.spawnSync([
-        "sh",
-        fileURLToPath(repoUrl("share-extension/macos/build.sh")),
-        outputDir,
-        "arm64",
-        "-",
-        "1.2.3\nextra",
-      ]);
+  // This invokes a POSIX shell script directly; Windows does not build the macOS extension.
+  test.skipIf(process.platform === "win32")(
+    "the share extension build rejects multiline bundle versions",
+    async () => {
+      const outputDir = await mkdtemp(join(tmpdir(), "carrier-share-version-"));
+      try {
+        const result = Bun.spawnSync([
+          "sh",
+          fileURLToPath(repoUrl("share-extension/macos/build.sh")),
+          outputDir,
+          "arm64",
+          "-",
+          "1.2.3\nextra",
+        ]);
 
-      expect(result.exitCode).not.toBe(0);
-      expect(new TextDecoder().decode(result.stderr)).toContain("invalid bundle version");
-    } finally {
-      await rm(outputDir, { force: true, recursive: true });
-    }
-  });
+        expect(result.exitCode).not.toBe(0);
+        expect(new TextDecoder().decode(result.stderr)).toContain("invalid bundle version");
+      } finally {
+        await rm(outputDir, { force: true, recursive: true });
+      }
+    },
+  );
 
   test("Settings loads the generated update consent controller", async () => {
     const [settings, controller] = await Promise.all([
