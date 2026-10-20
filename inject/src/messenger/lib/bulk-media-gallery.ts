@@ -12,6 +12,7 @@ export interface GalleryMedia {
   year: number;
   month: number;
   day: number;
+  sharedAt?: string;
   control: HTMLElement;
 }
 
@@ -46,7 +47,7 @@ const MONTHS = new Map<string, number>([
   ].map((name, index) => [name, index + 1] as const),
 ]);
 const DATE_LABEL =
-  /^(?:view (?:photo|video) sent on ([a-z]+) (\d{1,2}), (\d{4}), \d{1,2}:\d{2} ?(?:am|pm)|voir la (?:photo|video) envoyee? le (\d{1,2}) ([a-z]+) (\d{4})(?:(?:[, ]+| a )\d{1,2}:\d{2})?)$/u;
+  /^(?:view (?:photo|video) sent on ([a-z]+) (\d{1,2}), (\d{4})(?:, (.+))?|voir la (?:photo|video) envoyee? le (\d{1,2}) ([a-z]+) (\d{4})(?:(?:[, ]+| a )(.+))?)$/u;
 const MONTH_HEADING = /^([\p{L}]+)\s+(\d{4})$/u;
 const HIDDEN = '[hidden], [aria-hidden="true"], [inert]';
 const VIEWER_DIALOG = '[role="dialog"]';
@@ -75,11 +76,19 @@ export function parseGalleryMonthHeading(value: string): { year: number; month: 
 export function parseGalleryTileDate(
   value: string,
 ): { year: number; month: number; day: number } | null {
+  const parsed = parseGalleryTileTimestamp(value);
+  return parsed ? { year: parsed.year, month: parsed.month, day: parsed.day } : null;
+}
+
+export function parseGalleryTileTimestamp(
+  value: string,
+): { year: number; month: number; day: number; sharedAt?: string } | null {
   const match = normalized(value).match(DATE_LABEL);
   if (!match) return null;
-  const monthName = match[1] || match[5];
-  const day = Number(match[2] || match[4]);
-  const year = Number(match[3] || match[6]);
+  const french = !!match[5];
+  const monthName = match[french ? 6 : 1];
+  const day = Number(match[french ? 5 : 2]);
+  const year = Number(match[french ? 7 : 3]);
   const month = MONTHS.get(monthName!);
   if (!month || year < 1900 || year > 2200 || day < 1 || day > 31) return null;
   const actual = new Date(Date.UTC(year, month - 1, day));
@@ -89,7 +98,39 @@ export function parseGalleryTileDate(
     actual.getUTCDate() !== day
   )
     return null;
-  return { year, month, day };
+  const result = { year, month, day };
+  const clock = match[french ? 8 : 4];
+  if (!clock) return result;
+  const clockMatch = french
+    ? clock.match(/^(\d{1,2}):(\d{2})$/u)
+    : clock.match(/^(\d{1,2}):(\d{2})\s*(am|pm)$/u);
+  if (!clockMatch) return null;
+  let hour = Number(clockMatch[1]);
+  const minute = Number(clockMatch[2]);
+  if (minute > 59) return null;
+  if (french) {
+    if (hour > 23) return null;
+  } else {
+    if (hour < 1 || hour > 12) return null;
+    if (clockMatch[3] === "am") hour = hour === 12 ? 0 : hour;
+    else hour = hour === 12 ? 12 : hour + 12;
+  }
+  const local = new Date(year, month - 1, day, hour, minute, 0, 0);
+  // Date normalizes invalid times and DST gaps; neither is a reliable shared timestamp.
+  if (
+    local.getFullYear() !== year ||
+    local.getMonth() !== month - 1 ||
+    local.getDate() !== day ||
+    local.getHours() !== hour ||
+    local.getMinutes() !== minute
+  )
+    return null;
+  const offset = -local.getTimezoneOffset();
+  const sign = offset < 0 ? "-" : "+";
+  const offsetHour = String(Math.floor(Math.abs(offset) / 60)).padStart(2, "0");
+  const offsetMinute = String(Math.abs(offset) % 60).padStart(2, "0");
+  const sharedAt = `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00${sign}${offsetHour}:${offsetMinute}`;
+  return { ...result, sharedAt };
 }
 
 function isGalleryControl(element: HTMLElement): boolean {
@@ -194,7 +235,7 @@ function scan(gallery: MediaGallery): ScanResult {
       ...group.element.querySelectorAll<HTMLElement>('[role="button"][tabindex="0"][aria-label]'),
     ].filter(isGalleryControl);
     for (const control of controls) {
-      const date = parseGalleryTileDate(control.getAttribute("aria-label") || "");
+      const date = parseGalleryTileTimestamp(control.getAttribute("aria-label") || "");
       const alt = control.querySelector("img")?.getAttribute("alt") || "";
       if (!date || date.year !== group.heading.year || date.month !== group.heading.month) {
         problem = "Stopped because a gallery tile has a missing or ambiguous date.";
@@ -209,6 +250,7 @@ function scan(gallery: MediaGallery): ScanResult {
         year: date.year,
         month: date.month,
         day: date.day,
+        ...(date.sharedAt ? { sharedAt: date.sharedAt } : {}),
         control,
       });
     }
@@ -476,7 +518,11 @@ export class GalleryYearQueue {
     if (findBulkMediaSource(current)?.key !== item.key)
       throw new Error("Stopped because the media viewer changed before saving.");
     if (current !== viewer) this.ownedViewer = current;
-    await this.options.save(item);
+    await this.options.save({
+      ...item,
+      ...(media.sharedAt ? { sharedAt: media.sharedAt } : {}),
+      sharedDate: `${String(media.year).padStart(4, "0")}-${String(media.month).padStart(2, "0")}-${String(media.day).padStart(2, "0")}`,
+    });
     const scope = `${this.options.chatKey}\u0000${this.options.destinationKey}`;
     let completed = completedByScope.get(scope);
     if (!completed) {

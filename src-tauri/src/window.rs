@@ -316,14 +316,19 @@ fn build_app_window_with_render_budget(
                     }
                     *destination = unique_path(dir.join(name));
                 }
-                remember_download(&url, download_id.clone(), destination.clone());
+                remember_download(
+                    &download_label,
+                    &url,
+                    download_id.clone(),
+                    destination.clone(),
+                );
                 true
             }
             DownloadEvent::Finished { url, success, .. } => {
                 let download_id = if success {
-                    complete_download(&url)
+                    complete_download(&download_label, &url)
                 } else {
-                    forget_download(&url)
+                    forget_download(&download_label, &url)
                 }
                 .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
                 notify_download_finished(&download_handle, &webview, &download_id, &url, success);
@@ -1188,6 +1193,16 @@ fn init_script(
     }}
     return carrierAuthorizedEmit('carrier:reveal-download', {{ url: url }});
   }};
+  var carrierSetDownloadDate = function (url, sharedAt) {{
+    if (typeof url !== 'string' || typeof sharedAt !== 'string') {{
+      return NativePromise.reject(new Error('download date request was invalid'));
+    }}
+    return carrierNativeCall(
+      'carrier:set-download-date', 'dated',
+      'download date could not be applied', 'download date request timed out',
+      {{ url: url, sharedAt: sharedAt }}
+    );
+  }};
   var carrierClaimContextAction = function (action) {{
     if (!carrierAuthorizedEmit) {{
       return NativePromise.reject(new Error('native bridge unavailable'));
@@ -1636,6 +1651,16 @@ mod tests {
         assert!(script.contains("payload.request = request;"));
         assert!(script.contains("carrierAuthorizedEmit.verifyResult"));
         assert!(script.contains("detail.signature"));
+    }
+
+    #[test]
+    fn shared_download_date_uses_the_authenticated_native_call_factory() {
+        let script = init_script(&Settings::default(), 42, "test-reveal-token", true);
+
+        assert!(script.contains("var carrierSetDownloadDate = function (url, sharedAt)"));
+        assert!(script.contains("'carrier:set-download-date', 'dated'"));
+        assert!(script.contains("{ url: url, sharedAt: sharedAt }"));
+        assert!(!script.contains("window.carrierSetDownloadDate"));
     }
 
     #[test]

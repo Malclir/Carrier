@@ -8,6 +8,45 @@
   var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
   var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
 
+  // inject/src/messenger/lib/download-chat-name.ts
+  var downloadChatNameSlug = (name) => {
+    const normalized3 = String(name ?? "").normalize("NFKD").replace(/\p{M}+/gu, "").toLowerCase();
+    const slug = normalized3.replace(/[^\p{L}\p{N}]+/gu, "_").replace(/^_+|_+$/gu, "");
+    return Array.from(slug).slice(0, 40).join("").replace(/_+$/gu, "");
+  };
+  var conversationTitle = (value) => {
+    const match = /^Conversation (?:with|avec)\s+(.+?)\s*$/iu.exec(value.trim());
+    const title = match?.[1]?.trim();
+    return title || void 0;
+  };
+  var isVisible = (element2) => {
+    for (let current = element2; current; current = current.parentElement) {
+      if (current.hasAttribute("hidden") || current.hasAttribute("inert") || current.getAttribute("aria-hidden") === "true") {
+        return false;
+      }
+      const style = getComputedStyle(current);
+      if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") {
+        return false;
+      }
+    }
+    return true;
+  };
+  var findDownloadChatName = (root) => {
+    const names2 = /* @__PURE__ */ new Set();
+    for (const heading of root.querySelectorAll("h3")) {
+      const title = conversationTitle(heading.textContent || "");
+      const container = heading.parentElement;
+      if (!title || !container || container.tagName !== "DIV" || !isVisible(heading)) continue;
+      if (!container.querySelector('[contenteditable="true"]')) continue;
+      names2.add(title);
+    }
+    for (const log of root.querySelectorAll('[role="log"][aria-label]')) {
+      const title = conversationTitle(log.getAttribute("aria-label") || "");
+      if (title && isVisible(log)) names2.add(title);
+    }
+    return names2.size === 1 ? names2.values().next().value : void 0;
+  };
+
   // inject/src/messenger/lib/downloads.ts
   var filenameFromUrl = (u, base) => {
     try {
@@ -32,6 +71,26 @@
       return `Messenger${ext}`;
     }
     return name;
+  };
+  var validCalendarDate = (value) => {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(value);
+    if (!match) return false;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    if (year < 1 || month < 1 || month > 12 || day < 1 || day > 31) return false;
+    const date = /* @__PURE__ */ new Date(0);
+    date.setUTCHours(0, 0, 0, 0);
+    date.setUTCFullYear(year, month - 1, day);
+    return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+  };
+  var datedDownloadName = (name, sharedDate, sharedAt, chatName) => {
+    const timestampDate = sharedAt && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/u.test(sharedAt) ? sharedAt.slice(0, 10) : void 0;
+    const date = sharedDate && validCalendarDate(sharedDate) ? sharedDate : timestampDate && validCalendarDate(timestampDate) ? timestampDate : void 0;
+    if (!date) return name;
+    const { ext } = splitDownloadName(name);
+    const chatSlug = downloadChatNameSlug(chatName);
+    return `${chatSlug ? `${chatSlug}_` : ""}${date}${ext}`;
   };
   var downloadRevealLabel = (userAgent) => /Mac/i.test(userAgent) ? "Show in Finder" : "Show in folder";
   var isDownloadCancellation = (error) => error instanceof Error && error.message === "download cancelled";
@@ -2902,14 +2961,14 @@ ${button.innerHTML}`)
     const height = viewport.bottom - viewport.top;
     return width > 0 && height > 0 && visible2.right - visible2.left >= width * 0.75 && visible2.bottom - visible2.top >= height * 0.7;
   }
-  function isVisible(element2) {
+  function isVisible2(element2) {
     if (element2.closest(HIDDEN2)) return false;
     const style = getComputedStyle(element2);
     const rect = element2.getBoundingClientRect();
     return style.visibility === "visible" && rect.width > 0 && rect.height > 0;
   }
   function isMediaViewerDialog(dialog) {
-    if (!isVisible(dialog)) return false;
+    if (!isVisible2(dialog)) return false;
     const viewport = { left: 0, top: 0, right: innerWidth, bottom: innerHeight };
     const rect = dialog.getBoundingClientRect();
     if (!coversViewport(rect, viewport)) return false;
@@ -2927,7 +2986,7 @@ ${button.innerHTML}`)
     const media = [
       ...dialog.querySelectorAll("img, video")
     ].filter((element2) => {
-      if (!owns2(element2) || !isVisible(element2)) return false;
+      if (!owns2(element2) || !isVisible2(element2)) return false;
       const bounds = element2.getBoundingClientRect();
       const visible2 = intersectImageClips(intersectImageClips(bounds, rect), viewport);
       const width = (visible2.right - visible2.left) / Math.min(rect.width, viewport.right);
@@ -2941,7 +3000,7 @@ ${button.innerHTML}`)
       excluded,
       hasMedia: media.length > 0,
       hasDownload: [...dialog.querySelectorAll("a[download]")].some(
-        (element2) => owns2(element2) && isVisible(element2)
+        (element2) => owns2(element2) && isVisible2(element2)
       ),
       hasVideoControls: media.some(
         (element2) => element2 instanceof HTMLVideoElement && element2.controls
@@ -2980,7 +3039,7 @@ ${button.innerHTML}`)
       "decembre"
     ].map((name, index) => [name, index + 1])
   ]);
-  var DATE_LABEL = /^(?:view (?:photo|video) sent on ([a-z]+) (\d{1,2}), (\d{4}), \d{1,2}:\d{2} ?(?:am|pm)|voir la (?:photo|video) envoyee? le (\d{1,2}) ([a-z]+) (\d{4})(?:(?:[, ]+| a )\d{1,2}:\d{2})?)$/u;
+  var DATE_LABEL = /^(?:view (?:photo|video) sent on ([a-z]+) (\d{1,2}), (\d{4})(?:, (.+))?|voir la (?:photo|video) envoyee? le (\d{1,2}) ([a-z]+) (\d{4})(?:(?:[, ]+| a )(.+))?)$/u;
   var MONTH_HEADING = /^([\p{L}]+)\s+(\d{4})$/u;
   var HIDDEN3 = '[hidden], [aria-hidden="true"], [inert]';
   var VIEWER_DIALOG = '[role="dialog"]';
@@ -2998,18 +3057,42 @@ ${button.innerHTML}`)
     const year = Number(match[2]);
     return month && year >= 1900 && year <= 2200 ? { year, month } : null;
   }
-  function parseGalleryTileDate(value) {
+  function parseGalleryTileTimestamp(value) {
     const match = normalized(value).match(DATE_LABEL);
     if (!match) return null;
-    const monthName = match[1] || match[5];
-    const day = Number(match[2] || match[4]);
-    const year = Number(match[3] || match[6]);
+    const french = !!match[5];
+    const monthName = match[french ? 6 : 1];
+    const day = Number(match[french ? 5 : 2]);
+    const year = Number(match[french ? 7 : 3]);
     const month = MONTHS.get(monthName);
     if (!month || year < 1900 || year > 2200 || day < 1 || day > 31) return null;
     const actual = new Date(Date.UTC(year, month - 1, day));
     if (actual.getUTCFullYear() !== year || actual.getUTCMonth() !== month - 1 || actual.getUTCDate() !== day)
       return null;
-    return { year, month, day };
+    const result = { year, month, day };
+    const clock = match[french ? 8 : 4];
+    if (!clock) return result;
+    const clockMatch = french ? clock.match(/^(\d{1,2}):(\d{2})$/u) : clock.match(/^(\d{1,2}):(\d{2})\s*(am|pm)$/u);
+    if (!clockMatch) return null;
+    let hour = Number(clockMatch[1]);
+    const minute = Number(clockMatch[2]);
+    if (minute > 59) return null;
+    if (french) {
+      if (hour > 23) return null;
+    } else {
+      if (hour < 1 || hour > 12) return null;
+      if (clockMatch[3] === "am") hour = hour === 12 ? 0 : hour;
+      else hour = hour === 12 ? 12 : hour + 12;
+    }
+    const local = new Date(year, month - 1, day, hour, minute, 0, 0);
+    if (local.getFullYear() !== year || local.getMonth() !== month - 1 || local.getDate() !== day || local.getHours() !== hour || local.getMinutes() !== minute)
+      return null;
+    const offset = -local.getTimezoneOffset();
+    const sign = offset < 0 ? "-" : "+";
+    const offsetHour = String(Math.floor(Math.abs(offset) / 60)).padStart(2, "0");
+    const offsetMinute = String(Math.abs(offset) % 60).padStart(2, "0");
+    const sharedAt = `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00${sign}${offsetHour}:${offsetMinute}`;
+    return { ...result, sharedAt };
   }
   function isGalleryControl(element2) {
     if (element2.closest(HIDDEN3) || element2.closest("[data-carrier-bulk-media]")) return false;
@@ -3087,7 +3170,7 @@ ${button.innerHTML}`)
         ...group.element.querySelectorAll('[role="button"][tabindex="0"][aria-label]')
       ].filter(isGalleryControl);
       for (const control of controls) {
-        const date = parseGalleryTileDate(control.getAttribute("aria-label") || "");
+        const date = parseGalleryTileTimestamp(control.getAttribute("aria-label") || "");
         const alt = control.querySelector("img")?.getAttribute("alt") || "";
         if (!date || date.year !== group.heading.year || date.month !== group.heading.month) {
           problem = "Stopped because a gallery tile has a missing or ambiguous date.";
@@ -3102,6 +3185,7 @@ ${button.innerHTML}`)
           year: date.year,
           month: date.month,
           day: date.day,
+          ...date.sharedAt ? { sharedAt: date.sharedAt } : {},
           control
         });
       }
@@ -3336,7 +3420,11 @@ ${button.innerHTML}`)
       if (findBulkMediaSource(current)?.key !== item.key)
         throw new Error("Stopped because the media viewer changed before saving.");
       if (current !== viewer) this.ownedViewer = current;
-      await this.options.save(item);
+      await this.options.save({
+        ...item,
+        ...media.sharedAt ? { sharedAt: media.sharedAt } : {},
+        sharedDate: `${String(media.year).padStart(4, "0")}-${String(media.month).padStart(2, "0")}-${String(media.day).padStart(2, "0")}`
+      });
       const scope = `${this.options.chatKey}\0${this.options.destinationKey}`;
       let completed = completedByScope.get(scope);
       if (!completed) {
@@ -3742,7 +3830,12 @@ ${button.innerHTML}`)
   }
   var oversizeByHeader = (res) => Number(res.headers.get("content-length")) > MAX_BLOB;
   var copyAddress = (text) => navigator.clipboard?.writeText(cleanSharedUrl(text)).then(() => toast("Address copied")).catch(() => toast("Copy failed"));
-  async function downloadSrc(src, fallbackName, action2, batchFolder) {
+  async function downloadSrc(src, fallbackName, action2, batchFolder, sharedAt, sharedDate, chatName) {
+    if (sharedAt && typeof carrierSetDownloadDate !== "function") {
+      throw new Error(
+        "Stopped because this file's shared date cannot be preserved. Update and reopen Carrier."
+      );
+    }
     const res = await fetch(src);
     if (!res.ok) throw new Error(`download failed (${res.status})`);
     if (oversizeByHeader(res)) throw new Error("file too large");
@@ -3754,6 +3847,7 @@ ${button.innerHTML}`)
       const ext = ((blob.type || "").split("/")[1] || "").split(";")[0];
       if (ext) name += `.${ext}`;
     }
+    name = datedDownloadName(name, sharedDate, sharedAt, chatName);
     const a = document.createElement("a");
     a.href = href;
     a.download = name;
@@ -3772,7 +3866,18 @@ ${button.innerHTML}`)
       }
       const completion = waitForNativeDownload(window, href, carrierVerifyResult);
       a.click();
-      return await completion;
+      const completed = await completion;
+      if (sharedAt) {
+        try {
+          await carrierSetDownloadDate(completed.url, sharedAt);
+        } catch (error) {
+          const detail = error instanceof Error && error.message ? ` ${error.message}` : "";
+          throw new Error(
+            `Stopped because the file was saved but its shared date was not updated.${detail}`
+          );
+        }
+      }
+      return completed;
     } finally {
       a.remove();
       URL.revokeObjectURL(href);
@@ -4164,12 +4269,21 @@ ${button.innerHTML}`)
       stopDirectionListening?.();
       stopDirectionListening = null;
       const queuedDialog = dialog;
+      const queuedChatName = findDownloadChatName(document);
       const stillInQueue = () => !!queuedDialog.isConnected && activeDialog === queuedDialog && isViewer(queuedDialog) && chatKey() === queuedChatKey;
       queue = new BulkMediaQueue(
         {
           current: () => isViewer(queuedDialog) ? findBulkMediaSource(queuedDialog) : null,
           save: async (item) => {
-            await downloadSrc(item.src, item.fallbackName, void 0, folder ?? void 0);
+            await downloadSrc(
+              item.src,
+              item.fallbackName,
+              void 0,
+              folder ?? void 0,
+              item.sharedAt,
+              item.sharedDate,
+              queuedChatName
+            );
           },
           advance: async (selectedDirection, previousKey) => {
             if (!stillInQueue()) return false;
@@ -4283,7 +4397,7 @@ ${button.innerHTML}`)
       const askWithoutFolder = window.__CARRIER_SETTINGS__?.download_behavior === "ask" && !folder;
       const nativeMissing = !!folder && typeof carrierPrepareBatchDownload !== "function";
       const yearBlockedByViewer = mode === "year" && !!activeDialog;
-      const hint = actionError || (mode === "year" ? !activeGallery ? "Open the shared media gallery to choose a year." : yearBlockedByViewer ? "Close the full-size photo or video before starting a whole-year batch." : askWithoutFolder ? "Choose a batch folder or set Carrier Settings to “Downloads folder” and reopen the viewer." : nativeMissing ? "Batch folders require a newer Carrier version. Update and reopen the app." : "Saves dated photo and video originals from the selected year. Messenger may not expose the full history." : askWithoutFolder ? "Choose a batch folder or set Carrier Settings to “Downloads folder” and reopen the viewer." : "Starts from the open photo and follows Previous or Next.");
+      const hint = actionError || (mode === "year" ? !activeGallery ? "Open the shared media gallery to choose a year." : yearBlockedByViewer ? "Close the full-size photo or video before starting a whole-year batch." : askWithoutFolder ? "Choose a batch folder or set Carrier Settings to “Downloads folder” and reopen the viewer." : nativeMissing ? "Batch folders require a newer Carrier version. Update and reopen the app." : "Saves dated photo and video originals from the selected year and preserves displayed dates when available. Messenger may not expose the full history." : askWithoutFolder ? "Choose a batch folder or set Carrier Settings to “Downloads folder” and reopen the viewer." : "Starts from the open photo and follows Previous or Next.");
       const focusedElement = root.activeElement instanceof HTMLElement ? root.activeElement : null;
       const focusControl = focusedElement?.dataset.control ? `[data-control="${focusedElement.dataset.control}"]` : focusedElement?.dataset.action ? `[data-action="${focusedElement.dataset.action}"]` : focusedElement?.dataset.direction ? `[data-direction="${focusedElement.dataset.direction}"]` : focusedElement?.classList.contains("open") ? ".open" : "";
       const focusedValue = focusedElement instanceof HTMLInputElement || focusedElement instanceof HTMLSelectElement ? focusedElement.value : null;
@@ -4427,6 +4541,7 @@ ${button.innerHTML}`)
           const gallery = activeGallery;
           const queuedChatKey = activeChatKey;
           const selectedFolder = folder;
+          const queuedChatName = findDownloadChatName(document);
           galleryQueue?.cancel("A new year batch was started.");
           stopGalleryListening?.();
           stopGalleryListening = null;
@@ -4436,7 +4551,15 @@ ${button.innerHTML}`)
             destinationKey,
             stillInChat: () => chatKey() === queuedChatKey,
             save: async (item) => {
-              await downloadSrc(item.src, item.fallbackName, void 0, selectedFolder || void 0);
+              await downloadSrc(
+                item.src,
+                item.fallbackName,
+                void 0,
+                selectedFolder || void 0,
+                item.sharedAt,
+                item.sharedDate,
+                queuedChatName
+              );
             }
           });
           galleryQueueRoot = gallery.root;

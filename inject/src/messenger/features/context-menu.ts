@@ -9,7 +9,7 @@ import {
   toastDownloadSaved,
 } from "../bridge";
 import { waitForNativeDownload } from "../lib/download-completion";
-import { filenameFromUrl, friendlyDownloadName } from "../lib/downloads";
+import { datedDownloadName, filenameFromUrl, friendlyDownloadName } from "../lib/downloads";
 import { cssPropertyName, type MenuRect, pointerActivationIsSound } from "../lib/menu-integrity";
 
 const MAX_BLOB = 512 * 1024 * 1024;
@@ -214,7 +214,15 @@ export async function downloadSrc(
   fallbackName: string,
   action?: string,
   batchFolder?: string,
+  sharedAt?: string,
+  sharedDate?: string,
+  chatName?: string,
 ): Promise<{ id: string; url: string }> {
+  if (sharedAt && typeof carrierSetDownloadDate !== "function") {
+    throw new Error(
+      "Stopped because this file's shared date cannot be preserved. Update and reopen Carrier.",
+    );
+  }
   // Fetch into a same-origin blob so the `download` attribute is honoured (it's
   // ignored for cross-origin URLs) and so we can derive the real extension.
   const res = await fetch(src);
@@ -230,6 +238,7 @@ export async function downloadSrc(
     const ext = ((blob.type || "").split("/")[1] || "").split(";")[0];
     if (ext) name += `.${ext}`;
   }
+  name = datedDownloadName(name, sharedDate, sharedAt, chatName);
   const a = document.createElement("a");
   a.href = href;
   a.download = name;
@@ -248,7 +257,18 @@ export async function downloadSrc(
     }
     const completion = waitForNativeDownload(window, href, carrierVerifyResult);
     a.click();
-    return await completion;
+    const completed = await completion;
+    if (sharedAt) {
+      try {
+        await carrierSetDownloadDate(completed.url, sharedAt);
+      } catch (error) {
+        const detail = error instanceof Error && error.message ? ` ${error.message}` : "";
+        throw new Error(
+          `Stopped because the file was saved but its shared date was not updated.${detail}`,
+        );
+      }
+    }
+    return completed;
   } finally {
     a.remove();
     URL.revokeObjectURL(href);

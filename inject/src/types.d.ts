@@ -114,6 +114,9 @@ declare const carrierPrepareBatchDownload: (
   name: string,
 ) => Promise<unknown>;
 
+/** Set timestamps for a completed download from a gallery's displayed message time. */
+declare const carrierSetDownloadDate: (url: string, sharedAt: string) => Promise<unknown>;
+
 /**
  * Same closure-scoped credential, second action: open the macOS share sheet
  * for a just-downloaded file, anchored at viewport fractions (0..1 top-left).

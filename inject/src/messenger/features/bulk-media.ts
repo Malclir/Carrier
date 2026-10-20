@@ -13,6 +13,7 @@ import {
   type MediaGallery,
 } from "../lib/bulk-media-gallery";
 import { findRolelessMediaViewer, isBulkMediaViewer } from "../lib/bulk-media-viewer";
+import { findDownloadChatName } from "../lib/download-chat-name";
 import { isMediaViewerDialog } from "../lib/media-viewer";
 import { downloadSrc } from "./context-menu";
 
@@ -112,6 +113,7 @@ export function initBulkMedia() {
     stopDirectionListening?.();
     stopDirectionListening = null;
     const queuedDialog = dialog;
+    const queuedChatName = findDownloadChatName(document);
     const stillInQueue = () =>
       !!queuedDialog.isConnected &&
       activeDialog === queuedDialog &&
@@ -121,7 +123,15 @@ export function initBulkMedia() {
       {
         current: () => (isViewer(queuedDialog) ? findBulkMediaSource(queuedDialog) : null),
         save: async (item) => {
-          await downloadSrc(item.src, item.fallbackName, undefined, folder ?? undefined);
+          await downloadSrc(
+            item.src,
+            item.fallbackName,
+            undefined,
+            folder ?? undefined,
+            item.sharedAt,
+            item.sharedDate,
+            queuedChatName,
+          );
         },
         advance: async (selectedDirection, previousKey) => {
           if (!stillInQueue()) return false;
@@ -266,7 +276,7 @@ export function initBulkMedia() {
               ? "Choose a batch folder or set Carrier Settings to “Downloads folder” and reopen the viewer."
               : nativeMissing
                 ? "Batch folders require a newer Carrier version. Update and reopen the app."
-                : "Saves dated photo and video originals from the selected year. Messenger may not expose the full history."
+                : "Saves dated photo and video originals from the selected year and preserves displayed dates when available. Messenger may not expose the full history."
         : askWithoutFolder
           ? "Choose a batch folder or set Carrier Settings to “Downloads folder” and reopen the viewer."
           : "Starts from the open photo and follows Previous or Next.");
@@ -442,6 +452,7 @@ export function initBulkMedia() {
         const gallery = activeGallery;
         const queuedChatKey = activeChatKey;
         const selectedFolder = folder;
+        const queuedChatName = findDownloadChatName(document);
         galleryQueue?.cancel("A new year batch was started.");
         stopGalleryListening?.();
         stopGalleryListening = null;
@@ -451,7 +462,15 @@ export function initBulkMedia() {
           destinationKey,
           stillInChat: () => chatKey() === queuedChatKey,
           save: async (item) => {
-            await downloadSrc(item.src, item.fallbackName, undefined, selectedFolder || undefined);
+            await downloadSrc(
+              item.src,
+              item.fallbackName,
+              undefined,
+              selectedFolder || undefined,
+              item.sharedAt,
+              item.sharedDate,
+              queuedChatName,
+            );
           },
         });
         galleryQueueRoot = gallery.root;

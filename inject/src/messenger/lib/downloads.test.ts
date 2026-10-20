@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { downloadChatNameSlug } from "./download-chat-name";
 import {
+  datedDownloadName,
   downloadRevealLabel,
   filenameFromUrl,
   friendlyDownloadName,
@@ -50,6 +52,59 @@ describe("friendlyDownloadName", () => {
   test("keeps real filenames untouched", () => {
     expect(friendlyDownloadName("holiday_2025.jpg")).toBe("holiday_2025.jpg");
     expect(friendlyDownloadName("report final.pdf")).toBe("report final.pdf");
+  });
+});
+
+describe("datedDownloadName", () => {
+  test("uses the gallery calendar date and keeps image or video extensions", () => {
+    expect(datedDownloadName("Messenger.jpg", "2020-06-26")).toBe("2020-06-26.jpg");
+    expect(datedDownloadName("clip.mp4", "2020-06-02")).toBe("2020-06-02.mp4");
+    expect(datedDownloadName("photo.tar.jpg", "2020-06-26")).toBe("2020-06-26.jpg");
+  });
+
+  test("prefixes valid dated names with a safe chat slug", () => {
+    expect(datedDownloadName("photo.jpg", "2020-06-26", undefined, "First Last")).toBe(
+      "first_last_2020-06-26.jpg",
+    );
+    expect(datedDownloadName("photo.jpg", "2020-06-26", undefined, "👩‍👩‍👧‍👦")).toBe(
+      "2020-06-26.jpg",
+    );
+    expect(datedDownloadName("photo.jpg", undefined, undefined, "First Last")).toBe("photo.jpg");
+  });
+
+  test("falls back to a valid sharedAt date prefix and leaves ordinary names unchanged", () => {
+    expect(datedDownloadName("image.png", undefined, "2020-02-29T23:59:00-08:00")).toBe(
+      "2020-02-29.png",
+    );
+    expect(datedDownloadName("family.jpg")).toBe("family.jpg");
+    expect(datedDownloadName("family.jpg", "invalid-date")).toBe("family.jpg");
+  });
+
+  test("rejects invalid dates and uses a valid timestamp fallback", () => {
+    expect(datedDownloadName("image.jpg", "2021-02-29")).toBe("image.jpg");
+    expect(datedDownloadName("image.jpg", "2021-02-29", "2020-12-31T23:59:00+02:00")).toBe(
+      "2020-12-31.jpg",
+    );
+    expect(datedDownloadName("image.jpg", "2020-1-02")).toBe("image.jpg");
+    expect(datedDownloadName("image.jpg", undefined, "garbage-at-the-end")).toBe("image.jpg");
+    expect(datedDownloadName("image.jpg", undefined, "2020-12-31garbage")).toBe("image.jpg");
+  });
+});
+
+describe("downloadChatNameSlug", () => {
+  test("normalizes accents and separates Unicode words", () => {
+    expect(downloadChatNameSlug("Élodie Núñez")).toBe("elodie_nunez");
+    expect(downloadChatNameSlug("李 雷")).toBe("李_雷");
+  });
+
+  test("removes unsafe punctuation, path separators, and emoji", () => {
+    expect(downloadChatNameSlug("A/B:C*D? 😀 E")).toBe("a_b_c_d_e");
+    expect(downloadChatNameSlug("👩‍🚀")).toBe("");
+  });
+
+  test("caps the slug at 40 Unicode characters and trims underscores", () => {
+    expect(downloadChatNameSlug(`__${"漢".repeat(45)}__`)).toBe("漢".repeat(40));
+    expect(Array.from(downloadChatNameSlug(`${"𐐀".repeat(45)}x`))).toHaveLength(40);
   });
 });
 

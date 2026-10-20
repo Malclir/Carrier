@@ -148,6 +148,7 @@ async function runFixture(
     addGroup("June 2020", [
       { label: "View photo sent on June 26, 2020, 3:39 PM", id: "111" },
       { label: "View video sent on June 2, 2020, 11:05 AM", id: "222", alt: "video-456.mp4" },
+      { label: "View photo sent on June 15, 2020", id: "333" },
     ]);
     let loadedOlderBoundary = false;
     setTimeout(() => {
@@ -159,14 +160,14 @@ async function runFixture(
     const queueMedia = find();
     if (!queueMedia || queueMedia.scroller !== queueGallery)
       throw new Error("queue gallery detection");
-    const saved: string[] = [];
+    const saved: Array<{ src: string; sharedAt?: string; sharedDate?: string }> = [];
     const options = (destinationKey: string) => ({
       gallery: queueMedia,
       chatKey: "fixture-chat",
       destinationKey,
       stillInChat: () => true,
-      save: async (item: { src: string }) => {
-        saved.push(item.src);
+      save: async (item: { src: string; sharedAt?: string; sharedDate?: string }) => {
+        saved.push({ src: item.src, sharedAt: item.sharedAt, sharedDate: item.sharedDate });
       },
     });
     const finish = (queue: InstanceType<typeof Queue>) =>
@@ -182,13 +183,24 @@ async function runFixture(
     const firstDone = finish(first);
     first.start(2020);
     const firstState = await firstDone;
-    if (firstState.status !== "complete" || firstState.counts.saved !== 2)
+    if (firstState.status !== "complete" || firstState.counts.saved !== 3)
       throw new Error(
         `year queue target saves/completion: ${firstState.status}, ${firstState.counts.saved} saved, ${firstState.counts.failed} failed, ${firstState.reason}`,
       );
     if (!loadedOlderBoundary) throw new Error("delayed older boundary did not load");
-    if (saved.length !== 2 || saved.some((src) => src.includes("2021") || src.includes("2019")))
+    if (saved.length !== 3 || saved.some(({ src }) => src.includes("2021") || src.includes("2019")))
       throw new Error("queue saved outside the selected year");
+    const expectedLocal = new Date(2020, 5, 26, 15, 39);
+    const offset = -expectedLocal.getTimezoneOffset();
+    const offsetSign = offset < 0 ? "-" : "+";
+    const offsetHour = String(Math.floor(Math.abs(offset) / 60)).padStart(2, "0");
+    const offsetMinute = String(Math.abs(offset) % 60).padStart(2, "0");
+    const firstItem = saved.find(({ src }) => src.includes("111"));
+    if (firstItem?.sharedAt !== `2020-06-26T15:39:00${offsetSign}${offsetHour}:${offsetMinute}`)
+      throw new Error(`gallery timestamp did not reach save: ${firstItem?.sharedAt}`);
+    const dateOnly = saved.find(({ src }) => src.includes("/333."));
+    if (dateOnly?.sharedAt !== undefined || dateOnly?.sharedDate !== "2020-06-15")
+      throw new Error("gallery date without a clock received a guessed timestamp");
 
     const duplicate = new Queue(options("downloads-a"));
     const duplicateDone = finish(duplicate);
@@ -196,8 +208,8 @@ async function runFixture(
     const duplicateState = await duplicateDone;
     if (
       duplicateState.status !== "complete" ||
-      duplicateState.counts.skipped !== 2 ||
-      saved.length !== 2
+      duplicateState.counts.skipped !== 3 ||
+      saved.length !== 3
     )
       throw new Error("destination scoped dedup");
 
@@ -207,8 +219,8 @@ async function runFixture(
     const separateState = await separateDone;
     if (
       separateState.status !== "complete" ||
-      separateState.counts.saved !== 2 ||
-      Number(saved.length) !== 4
+      separateState.counts.saved !== 3 ||
+      Number(saved.length) !== 6
     )
       throw new Error("destination dedup leaked");
 
@@ -217,7 +229,7 @@ async function runFixture(
     canceled.pause();
     canceled.cancel("fixture canceled");
     await new Promise((resolve) => setTimeout(resolve, 400));
-    if (canceled.state.status !== "idle" || Number(saved.length) !== 4)
+    if (canceled.state.status !== "idle" || Number(saved.length) !== 6)
       throw new Error("cancel while paused saved media");
 
     refuseClose = true;

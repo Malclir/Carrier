@@ -27,6 +27,7 @@ const MAX_DOWNLOAD_ID_LEN: usize = 32;
 
 struct RecentDownload {
     url: String,
+    window_label: String,
     id: String,
     path: PathBuf,
     at: Instant,
@@ -50,14 +51,23 @@ impl RecentDownloads {
         });
     }
 
-    fn remember_at(&mut self, url: &str, id: String, path: PathBuf, now: Instant) {
+    fn remember_at(
+        &mut self,
+        window_label: &str,
+        url: &str,
+        id: String,
+        path: PathBuf,
+        now: Instant,
+    ) {
         if url.is_empty() || url.len() > MAX_DOWNLOAD_URL_LEN {
             return;
         }
         self.prune(now);
-        self.entries.retain(|entry| entry.url != url);
+        self.entries
+            .retain(|entry| entry.window_label != window_label || entry.url != url);
         self.entries.push_back(RecentDownload {
             url: url.to_string(),
+            window_label: window_label.to_string(),
             id,
             path,
             at: now,
@@ -79,6 +89,26 @@ impl RecentDownloads {
             .map(|entry| entry.path.clone())
     }
 
+    fn lookup_completed_for_window_at(
+        &mut self,
+        window_label: &str,
+        url: &str,
+        now: Instant,
+    ) -> Option<PathBuf> {
+        if window_label.is_empty()
+            || url.is_empty()
+            || url.len() > MAX_DOWNLOAD_URL_LEN
+            || !url.starts_with("blob:")
+        {
+            return None;
+        }
+        self.prune(now);
+        self.entries
+            .iter()
+            .find(|entry| entry.window_label == window_label && entry.url == url && entry.completed)
+            .map(|entry| entry.path.clone())
+    }
+
     #[cfg(target_os = "macos")]
     fn lookup_id_at(&mut self, id: &str, now: Instant) -> Option<PathBuf> {
         if id.is_empty() || id.len() > MAX_DOWNLOAD_ID_LEN {
@@ -91,8 +121,12 @@ impl RecentDownloads {
             .map(|entry| entry.path.clone())
     }
 
-    fn complete_at(&mut self, url: &str, now: Instant) -> Option<String> {
-        if let Some(index) = self.entries.iter().position(|entry| entry.url == url) {
+    fn complete_at(&mut self, window_label: &str, url: &str, now: Instant) -> Option<String> {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.window_label == window_label && entry.url == url)
+        {
             let mut entry = self.entries.remove(index).expect("entry index is valid");
             entry.completed = true;
             entry.at = now;
@@ -103,13 +137,14 @@ impl RecentDownloads {
         None
     }
 
-    fn forget(&mut self, url: &str) -> Option<String> {
+    fn forget(&mut self, window_label: &str, url: &str) -> Option<String> {
         let id = self
             .entries
             .iter()
-            .find(|entry| entry.url == url)
+            .find(|entry| entry.window_label == window_label && entry.url == url)
             .map(|entry| entry.id.clone());
-        self.entries.retain(|entry| entry.url != url);
+        self.entries
+            .retain(|entry| entry.window_label != window_label || entry.url != url);
         id
     }
 }
@@ -123,22 +158,28 @@ fn recent_downloads() -> &'static Mutex<RecentDownloads> {
 /// Remember a destination chosen by the trusted WebView download hook. The
 /// remote page receives only opaque URL/identity keys and can never supply a
 /// filesystem path.
-pub(crate) fn remember_download(url: &Url, id: String, path: PathBuf) {
+pub(crate) fn remember_download(window_label: &str, url: &Url, id: String, path: PathBuf) {
+    recent_downloads().lock().unwrap().remember_at(
+        window_label,
+        url.as_str(),
+        id,
+        path,
+        Instant::now(),
+    );
+}
+
+pub(crate) fn forget_download(window_label: &str, url: &Url) -> Option<String> {
     recent_downloads()
         .lock()
         .unwrap()
-        .remember_at(url.as_str(), id, path, Instant::now());
+        .forget(window_label, url.as_str())
 }
 
-pub(crate) fn forget_download(url: &Url) -> Option<String> {
-    recent_downloads().lock().unwrap().forget(url.as_str())
-}
-
-pub(crate) fn complete_download(url: &Url) -> Option<String> {
+pub(crate) fn complete_download(window_label: &str, url: &Url) -> Option<String> {
     recent_downloads()
         .lock()
         .unwrap()
-        .complete_at(url.as_str(), Instant::now())
+        .complete_at(window_label, url.as_str(), Instant::now())
 }
 
 /// Non-consuming lookup so repeated clicks on the toast action keep working.
@@ -147,6 +188,18 @@ pub(crate) fn lookup_download(url: &str) -> Option<PathBuf> {
         .lock()
         .unwrap()
         .lookup_at(url, Instant::now())
+}
+
+/// Resolve only a completed blob download initiated in the requesting window.
+/// The URL is an opaque key; callers never accept or return page-supplied paths.
+pub(crate) fn lookup_completed_download_for_window(
+    window_label: &str,
+    url: &str,
+) -> Option<PathBuf> {
+    recent_downloads()
+        .lock()
+        .unwrap()
+        .lookup_completed_for_window_at(window_label, url, Instant::now())
 }
 
 #[cfg(target_os = "macos")]
@@ -333,7 +386,7 @@ pub(crate) fn is_unsafe_download(name: &str) -> bool {
     )
 }
 
-/// Avoid clobbering an existing file by appending " (n)".
+/// Avoid clobbering an existing file: date stems get "-n", other names " (n)".
 pub(crate) fn unique_path(p: PathBuf) -> PathBuf {
     if !p.exists() {
         return p;
@@ -349,6 +402,18 @@ pub(crate) fn unique_path(p: PathBuf) -> PathBuf {
         .map(|e| format!(".{e}"))
         .unwrap_or_default();
     let parent = p.parent().map(|x| x.to_path_buf()).unwrap_or_default();
+
+    if is_valid_date_stem(&stem) {
+        let mut suffix = String::from("1");
+        loop {
+            let cand = parent.join(format!("{stem}-{suffix}{ext}"));
+            if !cand.exists() {
+                return cand;
+            }
+            increment_decimal(&mut suffix);
+        }
+    }
+
     for n in 1..10000 {
         let cand = parent.join(format!("{stem} ({n}){ext}"));
         if !cand.exists() {
@@ -356,6 +421,46 @@ pub(crate) fn unique_path(p: PathBuf) -> PathBuf {
         }
     }
     p
+}
+
+fn is_valid_date_stem(stem: &str) -> bool {
+    if valid_date(stem) {
+        return true;
+    }
+
+    let Some((slug, date)) = stem.rsplit_once('_') else {
+        return false;
+    };
+    let slug_len = slug.chars().count();
+    slug_len > 0
+        && slug_len <= 40
+        && slug
+            .chars()
+            .all(|c| c == '_' || c.is_numeric() || (c.is_alphabetic() && !c.is_uppercase()))
+        && valid_date(date)
+}
+
+fn valid_date(date: &str) -> bool {
+    date.len() == 10
+        && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .is_ok_and(|parsed| parsed.format("%Y-%m-%d").to_string() == date)
+}
+
+fn increment_decimal(value: &mut String) {
+    let mut digits = value.as_bytes().to_vec();
+    let mut carry = true;
+    for index in (0..digits.len()).rev() {
+        if digits[index] < b'9' {
+            digits[index] += 1;
+            carry = false;
+            break;
+        }
+        digits[index] = b'0';
+    }
+    if carry {
+        digits.insert(0, b'1');
+    }
+    *value = String::from_utf8(digits).expect("decimal suffix remains ASCII");
 }
 
 #[cfg(test)]
@@ -474,15 +579,7 @@ mod tests {
 
     #[test]
     fn unique_path_preserves_stem_and_extension() {
-        let dir = std::env::temp_dir().join(format!(
-            "carrier-unique-path-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_download_dir("ordinary");
 
         let first = dir.join("Messenger.jpeg");
         let second = dir.join("Messenger (1).jpeg");
@@ -496,17 +593,132 @@ mod tests {
     }
 
     #[test]
+    fn date_unique_path_returns_free_base_and_suffixes_duplicate_day() {
+        let dir = temp_download_dir("date-base");
+        let base = dir.join("2026-10-20.jpg");
+        assert_eq!(unique_path(base.clone()), base);
+
+        std::fs::write(&base, b"original image").unwrap();
+        let duplicate = dir.join("2026-10-20-1.jpg");
+        assert_eq!(unique_path(base.clone()), duplicate);
+        assert_eq!(std::fs::read(&base).unwrap(), b"original image");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn date_unique_path_skips_existing_gaps_and_preserves_extension() {
+        let dir = temp_download_dir("date-gap");
+        let base = dir.join("2024-02-29.webp");
+        std::fs::write(&base, b"original").unwrap();
+        std::fs::write(dir.join("2024-02-29-1.webp"), b"one").unwrap();
+        std::fs::write(dir.join("2024-02-29-2.webp"), b"two").unwrap();
+        std::fs::write(dir.join("2024-02-29-4.webp"), b"four").unwrap();
+
+        assert_eq!(unique_path(base.clone()), dir.join("2024-02-29-3.webp"));
+        assert_eq!(std::fs::read(&base).unwrap(), b"original");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn date_unique_path_continues_past_nine_collisions() {
+        let dir = temp_download_dir("date-many");
+        let base = dir.join("2025-12-31.mov");
+        std::fs::write(&base, b"original video").unwrap();
+        for n in 1..=12 {
+            std::fs::write(dir.join(format!("2025-12-31-{n}.mov")), b"collision").unwrap();
+        }
+
+        assert_eq!(unique_path(base.clone()), dir.join("2025-12-31-13.mov"));
+        assert_eq!(std::fs::read(&base).unwrap(), b"original video");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn named_date_unique_path_suffixes_collisions_and_preserves_video_bytes() {
+        let dir = temp_download_dir("named-date");
+        let base = dir.join("first_last_2026-10-20.mp4");
+        let first_collision = dir.join("first_last_2026-10-20-1.mp4");
+        std::fs::write(&base, b"original video").unwrap();
+        std::fs::write(&first_collision, b"first collision").unwrap();
+
+        assert_eq!(
+            unique_path(base.clone()),
+            dir.join("first_last_2026-10-20-2.mp4")
+        );
+        assert_eq!(std::fs::read(&base).unwrap(), b"original video");
+        assert_eq!(std::fs::read(&first_collision).unwrap(), b"first collision");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn named_date_unique_path_accepts_unicode_slug() {
+        let dir = temp_download_dir("unicode-date");
+        let base = dir.join("été_猫_2024-02-29.mov");
+        std::fs::write(&base, b"video").unwrap();
+        std::fs::write(dir.join("été_猫_2024-02-29-1.mov"), b"collision").unwrap();
+
+        assert_eq!(
+            unique_path(base.clone()),
+            dir.join("été_猫_2024-02-29-2.mov")
+        );
+        assert_eq!(std::fs::read(&base).unwrap(), b"video");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_named_date_stems_keep_ordinary_suffixes() {
+        let dir = temp_download_dir("invalid-named-date");
+        for stem in [
+            "name_2025-02-29", // invalid calendar date
+            "_2026-10-20",     // empty slug
+            "Name_2026-10-20", // uppercase prefix
+            "name-2026-10-20", // unsafe separator
+            "name space_2026-10-20",
+            "name!_2026-10-20",
+        ] {
+            let base = dir.join(format!("{stem}.mp4"));
+            std::fs::write(&base, b"original").unwrap();
+            assert_eq!(
+                unique_path(base),
+                dir.join(format!("{stem} (1).mp4")),
+                "unexpected collision format for {stem}"
+            );
+        }
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn temp_download_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "carrier-unique-path-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
     fn recent_downloads_are_capped_and_lookup_is_non_consuming() {
         let now = Instant::now();
         let mut downloads = RecentDownloads::default();
         for n in 0..=MAX_RECENT_DOWNLOADS {
             downloads.remember_at(
+                "main",
                 &format!("blob:carrier/{n}"),
                 format!("download-{n}"),
                 PathBuf::from(format!("download-{n}.png")),
                 now,
             );
-            downloads.complete_at(&format!("blob:carrier/{n}"), now);
+            downloads.complete_at("main", &format!("blob:carrier/{n}"), now);
         }
 
         assert_eq!(downloads.entries.len(), MAX_RECENT_DOWNLOADS);
@@ -527,12 +739,13 @@ mod tests {
         let now = Instant::now();
         let mut downloads = RecentDownloads::default();
         downloads.remember_at(
+            "main",
             "blob:carrier/expired",
             "expired-id".into(),
             PathBuf::from("expired.png"),
             now,
         );
-        downloads.complete_at("blob:carrier/expired", now);
+        downloads.complete_at("main", "blob:carrier/expired", now);
         assert_eq!(
             downloads.lookup_at(
                 "blob:carrier/expired",
@@ -542,12 +755,13 @@ mod tests {
         );
 
         downloads.remember_at(
+            "main",
             "blob:carrier/failed",
             "failed-id".into(),
             PathBuf::from("failed.png"),
             now,
         );
-        downloads.forget("blob:carrier/failed");
+        downloads.forget("main", "blob:carrier/failed");
         assert_eq!(downloads.lookup_at("blob:carrier/failed", now), None);
     }
 
@@ -557,6 +771,7 @@ mod tests {
         let mut downloads = RecentDownloads::default();
         let path = PathBuf::from("pending.png");
         downloads.remember_at(
+            "main",
             "blob:carrier/pending",
             "pending-id".into(),
             path.clone(),
@@ -564,8 +779,73 @@ mod tests {
         );
         assert_eq!(downloads.lookup_at("blob:carrier/pending", now), None);
 
-        downloads.complete_at("blob:carrier/pending", now);
+        downloads.complete_at("main", "blob:carrier/pending", now);
         assert_eq!(downloads.lookup_at("blob:carrier/pending", now), Some(path));
+    }
+
+    #[test]
+    fn date_lookup_requires_completed_recent_blob_from_same_window() {
+        let now = Instant::now();
+        let mut downloads = RecentDownloads::default();
+        let main_path = PathBuf::from("main.png");
+        let other_path = PathBuf::from("other.png");
+        downloads.remember_at(
+            "main",
+            "blob:carrier/main",
+            "main-id".into(),
+            main_path.clone(),
+            now,
+        );
+        downloads.remember_at(
+            "other",
+            "blob:carrier/main",
+            "other-id".into(),
+            other_path,
+            now,
+        );
+        downloads.complete_at("other", "blob:carrier/main", now);
+        downloads.complete_at("main", "blob:carrier/main", now);
+
+        assert_eq!(
+            downloads.lookup_completed_for_window_at("main", "blob:carrier/main", now),
+            Some(main_path)
+        );
+        assert_eq!(
+            downloads.lookup_completed_for_window_at("other", "blob:carrier/main", now),
+            Some(PathBuf::from("other.png")),
+            "a matching window may resolve its own same-URL download"
+        );
+        assert_eq!(
+            downloads.lookup_completed_for_window_at("main", "blob:carrier/unknown", now),
+            None
+        );
+        assert_eq!(
+            downloads.lookup_completed_for_window_at(
+                "main",
+                "blob:carrier/main",
+                now + RECENT_DOWNLOAD_TTL + Duration::from_millis(1)
+            ),
+            None,
+            "expired downloads must not resolve"
+        );
+
+        downloads.remember_at(
+            "main",
+            "blob:carrier/incomplete",
+            "pending-id".into(),
+            PathBuf::from("pending.png"),
+            now,
+        );
+        assert_eq!(
+            downloads.lookup_completed_for_window_at("main", "blob:carrier/incomplete", now),
+            None,
+            "downloads remain unavailable until completion"
+        );
+        assert_eq!(
+            downloads.lookup_completed_for_window_at("main", "https://fbcdn.net/photo.jpg", now),
+            None,
+            "date lookup accepts only page blob URLs"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -574,9 +854,15 @@ mod tests {
         let now = Instant::now();
         let mut downloads = RecentDownloads::default();
         let path = PathBuf::from("shared.png");
-        downloads.remember_at("blob:carrier/shared", "shared-id".into(), path.clone(), now);
+        downloads.remember_at(
+            "main",
+            "blob:carrier/shared",
+            "shared-id".into(),
+            path.clone(),
+            now,
+        );
         assert_eq!(downloads.lookup_id_at("shared-id", now), None);
-        downloads.complete_at("blob:carrier/shared", now);
+        downloads.complete_at("main", "blob:carrier/shared", now);
         assert_eq!(downloads.lookup_id_at("shared-id", now), Some(path));
         assert_eq!(downloads.lookup_id_at("unknown-id", now), None);
     }
@@ -587,14 +873,21 @@ mod tests {
         let completed = started + RECENT_DOWNLOAD_TTL + Duration::from_secs(1);
         let mut downloads = RecentDownloads::default();
         let path = PathBuf::from("slow.png");
-        downloads.remember_at("blob:carrier/slow", "slow-id".into(), path.clone(), started);
         downloads.remember_at(
+            "main",
+            "blob:carrier/slow",
+            "slow-id".into(),
+            path.clone(),
+            started,
+        );
+        downloads.remember_at(
+            "main",
             "blob:carrier/new",
             "new-id".into(),
             PathBuf::from("new.png"),
             completed,
         );
-        downloads.complete_at("blob:carrier/slow", completed);
+        downloads.complete_at("main", "blob:carrier/slow", completed);
 
         assert_eq!(
             downloads.lookup_at("blob:carrier/slow", completed),
@@ -615,6 +908,7 @@ mod tests {
         let mut downloads = RecentDownloads::default();
         let oversized = "x".repeat(MAX_DOWNLOAD_URL_LEN + 1);
         downloads.remember_at(
+            "main",
             &oversized,
             "ignored-id".into(),
             PathBuf::from("ignored.png"),

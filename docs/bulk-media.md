@@ -37,6 +37,27 @@ If Settings is configured to ask where to save every download, choose a batch
 folder first. That folder is used for this batch without changing the per-file
 ask setting. Ordinary downloads continue to follow the setting.
 
+Year batches preserve the timestamp Messenger displays for each gallery item
+when its label includes a valid clock time. Carrier interprets that displayed
+time in the computer's local time zone on the message date, including that
+date's daylight-saving offset, and keeps minute precision. A label without a
+clock time is saved without an inferred timestamp. Year-batch filenames use the
+open chat's name and the gallery date: `first_last_2020-06-26.jpg`, then
+`first_last_2020-06-26-1.jpg`, `first_last_2020-06-26-2.jpg`, and so on when a name
+already exists in the destination. The displayed name or nickname is captured
+when the batch starts, lowercased, and limited to 40 characters. Spaces become
+underscores; accents, emoji, and unsafe filename punctuation are removed or
+normalized. If the chat name cannot be identified, filenames use the date alone.
+The original media extension is retained, and date-only labels also receive
+dated filenames. JPEG and PNG files receive embedded date metadata. Carrier
+sets the file's modified time and, on macOS and
+Windows, its creation time. Other media formats receive file dates only. This
+applies to new year-batch downloads only: existing downloads are not retimestamped,
+and Messenger does not guarantee complete history or timestamps for every item.
+Embedded metadata processing supports JPEG/PNG files up to 64 MiB. If a photo's
+metadata cannot be updated safely, the original download remains intact and the
+batch stops with an error.
+
 Custom destinations need a build with the native batch-folder picker. If Carrier
 reports that the feature needs a newer version, build the updated app and restart it.
 Messenger only exposes part of a chat's gallery at a time; a year scan can stop
@@ -58,6 +79,24 @@ The local app uses the bundle identifier `local.carrier.media`, separate setting
 and logs, and disables automatic upstream update checks. This diagnostics build
 blocks upstream release updates. The original Carrier licensing and attribution
 remain in place.
+
+## Shared-date and filename validation (October 20, 2026)
+
+- Frontend lint, TypeScript, 726 tests, and injection bundle regeneration passed
+  (17 optional browser tests skipped). The focused Chrome gallery and chat-name
+  tests passed separately, including timestamp handoff and date-only labels.
+- Rust formatting, Clippy, and all 332 library tests passed.
+- Generated JPEG/PNG fixtures verified EXIF dates, timezone offsets, existing
+  orientation/description preservation, unchanged image data, and file dates.
+  An independent Pillow check also confirmed decoded pixels and metadata.
+- Regression tests cover photos without EXIF, malformed EXIF left unchanged,
+  and large unsupported media receiving filesystem dates only.
+- Filename tests cover local calendar dates, image/video extensions, existing
+  files, gaps in numbered filenames, more than nine collisions, chat-name
+  prefixes, Unicode names, and long or unsafe nicknames. A live read-only check
+  confirmed the open chat's name produces the expected filename prefix.
+- Live Messenger downloads with date preservation and the Windows build have
+  not yet been verified.
 
 ## Year and folder validation (October 9, 2026)
 

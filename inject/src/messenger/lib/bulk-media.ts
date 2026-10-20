@@ -6,6 +6,8 @@ export interface BulkMediaItem {
   key: string;
   src: string;
   fallbackName: string;
+  sharedAt?: string;
+  sharedDate?: string;
 }
 
 export interface BulkMediaCounts {

@@ -35,6 +35,7 @@ mod linux;
 mod linux_startup;
 #[cfg(target_os = "macos")]
 mod macos;
+mod media_metadata;
 mod media_permissions;
 mod menu;
 mod notifications;
@@ -60,7 +61,7 @@ use diag::{DIAG_SESSION_CAP, LOG_FILE_MAX_BYTES, parse_diag_payload, sanitize_di
 use download::lookup_download_id;
 use download::{
     downloads_dir, is_allowed_download, is_allowed_download_path, is_unsafe_download,
-    lookup_download, sanitize_filename, unique_path,
+    lookup_completed_download_for_window, lookup_download, sanitize_filename, unique_path,
 };
 use hotkey::reconcile_startup_global_hotkey;
 #[cfg(target_os = "linux")]
@@ -345,6 +346,11 @@ const SIGNED_ACTION_CONTEXT_MENU_MESSAGE_MAX: usize = 512 * 1024;
 const SIGNED_ACTION_COPY_IMAGE_MESSAGE_MAX: usize = 48 * 1024 * 1024;
 const SIGNED_ACTION_LARGE_MESSAGE_THRESHOLD: usize = 1024 * 1024;
 const SIGNED_ACTION_LARGE_MESSAGE_COOLDOWN: Duration = Duration::from_secs(1);
+// Timestamp metadata APIs can be slow or platform-backed. Serialize writes on
+// workers and cap active plus queued requests to avoid unbounded task buildup.
+const MAX_PENDING_DOWNLOAD_DATE_WRITES: usize = 4;
+static DOWNLOAD_DATE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static DOWNLOAD_DATE_PENDING: AtomicUsize = AtomicUsize::new(0);
 
 fn signed_action_message_limit(event: &str) -> usize {
     match event {
@@ -626,7 +632,7 @@ fn send_native_result(
 ) {
     // Every result correlates to a page-generated 32-hex request token; refuse
     // anything else before echoing it into an eval'd script.
-    if request.len() != 32 || !request.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !valid_native_request(request) {
         log::warn!("{event} result had an invalid request token");
         return;
     }
@@ -652,6 +658,10 @@ fn send_native_result(
     {
         log::warn!("failed to report {result_event}: {error}");
     }
+}
+
+fn valid_native_request(request: &str) -> bool {
+    request.len() == 32 && request.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(target_os = "macos")]
@@ -767,10 +777,6 @@ fn batch_folder_result_signature(
             label,
         },
     )
-}
-
-fn valid_native_request(request: &str) -> bool {
-    request.len() == 32 && request.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn send_batch_folder_result(
@@ -1447,6 +1453,120 @@ pub fn run() {
                     if let Err(error) = h.opener().reveal_item_in_dir(path) {
                         log::warn!("failed to reveal recent download: {error}");
                     }
+                });
+            });
+
+            // Only a signed post-download request can resolve its URL through
+            // the trusted completed-download map. Paths never cross the page
+            // boundary, and the lookup is scoped to the signing window.
+            let date_handle = app.handle().clone();
+            app.listen_any("carrier:set-download-date", move |event| {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                #[serde(rename_all = "camelCase")]
+                struct SetDownloadDateMsg {
+                    url: String,
+                    shared_at: String,
+                    request: String,
+                }
+
+                let Ok(signed) = serde_json::from_str::<SignedAction>(event.payload()) else {
+                    log::warn!("carrier:set-download-date payload did not parse");
+                    return;
+                };
+                let Some(label) = signed_action_window(
+                    &date_handle,
+                    "carrier:set-download-date",
+                    &signed,
+                ) else {
+                    log::warn!("carrier:set-download-date was not authorized");
+                    return;
+                };
+                let Ok(msg) = serde_json::from_str::<SetDownloadDateMsg>(&signed.message) else {
+                    log::warn!("carrier:set-download-date message did not parse");
+                    return;
+                };
+                if !valid_native_request(&msg.request) {
+                    log::warn!("carrier:set-download-date request token was invalid");
+                    return;
+                }
+                if !media_metadata::is_valid_shared_date(&msg.shared_at) {
+                    log::warn!("carrier:set-download-date rejected an invalid timestamp");
+                    send_native_result(
+                        &date_handle,
+                        &label,
+                        "carrier:set-download-date",
+                        "dated",
+                        &msg.request,
+                        false,
+                    );
+                    return;
+                }
+                let Some(path) = lookup_completed_download_for_window(&label, &msg.url) else {
+                    log::warn!("carrier:set-download-date had no matching completed download");
+                    send_native_result(
+                        &date_handle,
+                        &label,
+                        "carrier:set-download-date",
+                        "dated",
+                        &msg.request,
+                        false,
+                    );
+                    return;
+                };
+                if DOWNLOAD_DATE_PENDING
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                        (pending < MAX_PENDING_DOWNLOAD_DATE_WRITES).then_some(pending + 1)
+                    })
+                    .is_err()
+                {
+                    log::warn!("carrier:set-download-date queue is full");
+                    send_native_result(
+                        &date_handle,
+                        &label,
+                        "carrier:set-download-date",
+                        "dated",
+                        &msg.request,
+                        false,
+                    );
+                    return;
+                }
+
+                let task_handle = date_handle.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    struct PendingDateWrite;
+                    impl Drop for PendingDateWrite {
+                        fn drop(&mut self) {
+                            DOWNLOAD_DATE_PENDING.fetch_sub(1, Ordering::AcqRel);
+                        }
+                    }
+                    let _pending = PendingDateWrite;
+                    // The lock is held only on a blocking worker, never UI.
+                    let _guard = DOWNLOAD_DATE_WRITE_LOCK
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        media_metadata::apply_shared_date(&path, &msg.shared_at)
+                    }));
+                    let dated = match applied {
+                        Ok(Ok(())) => true,
+                        Ok(Err(error)) => {
+                            log::warn!("carrier:set-download-date failed: {error}");
+                            false
+                        }
+                        Err(_) => {
+                            log::warn!("carrier:set-download-date metadata worker panicked");
+                            false
+                        }
+                    };
+                    send_native_result(
+                        &task_handle,
+                        &label,
+                        "carrier:set-download-date",
+                        "dated",
+                        &msg.request,
+                        dated,
+                    );
                 });
             });
 

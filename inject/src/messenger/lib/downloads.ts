@@ -1,5 +1,6 @@
 /* Download-name helpers for the media download path (context menu + the
  * viewer's Download button). */
+import { downloadChatNameSlug } from "./download-chat-name";
 
 /** The basename of a URL's path, when it looks like a real filename. */
 export const filenameFromUrl = (u: string, base: string): string => {
@@ -34,6 +35,44 @@ export const friendlyDownloadName = (name: string): string => {
     return `Messenger${ext}`;
   }
   return name;
+};
+
+const validCalendarDate = (value: string): boolean => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (year < 1 || month < 1 || month > 12 || day < 1 || day > 31) return false;
+  const date = new Date(0);
+  date.setUTCHours(0, 0, 0, 0);
+  date.setUTCFullYear(year, month - 1, day);
+  return (
+    date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
+  );
+};
+
+/** Give a year-gallery download its displayed calendar date while keeping its resolved extension. */
+export const datedDownloadName = (
+  name: string,
+  sharedDate?: string,
+  sharedAt?: string,
+  chatName?: string,
+): string => {
+  const timestampDate =
+    sharedAt && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/u.test(sharedAt)
+      ? sharedAt.slice(0, 10)
+      : undefined;
+  const date =
+    sharedDate && validCalendarDate(sharedDate)
+      ? sharedDate
+      : timestampDate && validCalendarDate(timestampDate)
+        ? timestampDate
+        : undefined;
+  if (!date) return name;
+  const { ext } = splitDownloadName(name);
+  const chatSlug = downloadChatNameSlug(chatName);
+  return `${chatSlug ? `${chatSlug}_` : ""}${date}${ext}`;
 };
 
 export const downloadRevealLabel = (userAgent: string): string =>
